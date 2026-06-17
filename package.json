@@ -1,0 +1,20 @@
+{
+  "name": "hethongagent",
+  "version": "1.0.0",
+  "description": "Desktop coding-agent workspace built from the LangGraph/OpenHands research flow.",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check src/main/main.js && node --check src/main/preload.js && node --check src/main/pythonEngine.js && node --check src/main/agentPipeline.js && node --check src/main/llmClient.js && node --check src/main/sessionStore.js && node --check src/main/settingsStore.js && node --check src/main/workspace.js && node --check src/renderer/app.js && .\\.venv\\Scripts\\python.exe -m compileall engine"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "electron": "^40.9.3"
+  },
+  "dependencies": {
+    "@colbymchenry/codegraph": "^1.0.1"
+  }
+}

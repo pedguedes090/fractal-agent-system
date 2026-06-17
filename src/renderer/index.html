@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>He Thong Agent</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">A</div>
+          <div>
+            <h1>Hệ Thống Agent</h1>
+            <p id="workspaceLabel">Chưa mở thư mục</p>
+          </div>
+        </div>
+
+        <div class="top-actions">
+          <button id="chooseFolderBtn" class="primary-button" type="button">Mở thư mục</button>
+          <select id="sessionSelect" aria-label="Phiên làm việc"></select>
+          <button id="newSessionBtn" class="ghost-button" type="button">Phiên mới</button>
+        </div>
+      </header>
+
+      <section class="settings-bar" aria-label="Cấu hình model">
+        <label>
+          <span>Server</span>
+          <input id="serverInput" type="url" spellcheck="false" />
+        </label>
+        <label>
+          <span>Model</span>
+          <input id="modelInput" type="text" spellcheck="false" />
+        </label>
+        <label class="toggle-field">
+          <input id="autoConfirmInput" type="checkbox" />
+          <span>Auto xác nhận</span>
+        </label>
+        <button id="saveSettingsBtn" class="ghost-button" type="button">Lưu</button>
+        <div id="saveStatus" class="save-status"></div>
+      </section>
+
+      <main class="workspace">
+        <section class="chat-panel">
+          <div id="messages" class="messages"></div>
+          <form id="composer" class="composer">
+            <textarea
+              id="messageInput"
+              rows="1"
+              placeholder="Nhập việc cần làm trong thư mục đang mở"
+            ></textarea>
+            <button id="sendBtn" class="send-button" type="submit">Gửi</button>
+          </form>
+        </section>
+
+        <aside class="run-panel">
+          <div class="run-panel-header">
+            <h2>Luồng chạy</h2>
+            <div id="runState" class="run-state">Sẵn sàng</div>
+          </div>
+          <div id="progressList" class="progress-list"></div>
+        </aside>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
