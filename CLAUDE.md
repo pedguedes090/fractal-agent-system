@@ -28,9 +28,12 @@ Do **not** add `app.commandLine.appendSwitch("in-process-gpu")` or `"disable-gpu
 
 **Two-process desktop app:** Electron UI (`src/`) spawns a Python backend (`engine/agent_engine/server.py`) that communicates via HTTP NDJSON on `127.0.0.1:<random>`.
 
-**Pipeline:** 31-node LangGraph state machine declared in `engine/agent_engine/workflows/default.yaml` (YAML topology + Jinja2 sandbox for route conditions). LLM is used for semantic analysis/planning/review but NEVER chooses the next node, retry budget, or branch condition — those are deterministic.
+**Pipeline:** 34-node LangGraph state machine declared in `engine/agent_engine/workflows/default.yaml` (YAML topology + Jinja2 sandbox for route conditions). LLM is used for semantic analysis/planning/review but NEVER chooses the next node, retry budget, or branch condition — those are deterministic.
 
-**New node inserted between codegraph_context and intake fan-out:** `repo_intelligence` runs `RepoIntelligenceAgent.analyze()` producing a `ContextPack` with source-verified evidence, architecture reconstruction, and impact analysis. Planning nodes now receive `repoIntelligence` via contextRoutes.
+**Key pipeline insertions:**
+- `repo_intelligence` (between codegraph_context and intake fan-out): runs `RepoIntelligenceAgent.analyze()` producing a `ContextPack`.
+- `doctor_feedback` (between code_reviewer_agent and release_deploy_agent): runs the Project Doctor's autonomous scan→plan→patch→verify loop. On success, reviewer_decision downgrades hygiene blockers (syntax, deps, lockfile, gitignore) to warnings — the reviewer can then clear the review even after prior test failures.
+- `reviewer_decision` → `openhands_worker` rework loop is the only cycle in the DAG.
 
 **Control plane:** Single SQLite DB `agent-state.sqlite` (WAL mode, `agent_state/` directory). All lifecycle authority lives here — no separate broker/checkpoint/execution files after migration. ADR: `docs/architecture/0001-local-first-control-plane.md`.
 
@@ -54,21 +57,54 @@ Do **not** add `app.commandLine.appendSwitch("in-process-gpu")` or `"disable-gpu
 | `deterministic_workflow.py` | YAML validator + Jinja2 sandbox + `DEFAULT_WORKFLOW` singleton | `DeterministicWorkflow` |
 | `durable_execution.py` | Lease/heartbeat/retry/idempotency, `DurableExecutionStore` | `checkpoint_step`, `execution_context` |
 | `telemetry.py` | OpenTelemetry tracing/metrics, `start_span()` contextmanager | `configure_telemetry` |
+| `project_doctor/` | Autonomous scan→plan→patch→verify pipeline (scanner, planner, patcher, verifier, orchestrator). Uses `claude-agent-sdk` with fallback to `anthropic` SDK | `run_doctor`, `Doctor`, `ScanReport`, `FixReport` |
+| `agent_sdk_provider.py` | Thin adapter over `claude-agent-sdk.query()` — Read/Edit/Bash agent with live token streaming into `emit()` | `ClaudeAgentSDKProvider`, `maybe_build_provider` |
+| `codebase_memory.py` | Gateway to the `codebase-memory-mcp` binary (knowledge graph: search, trace, architecture). Falls back gracefully when binary is missing | `search_graph`, `trace_path`, `get_architecture` |
+| `skill_registry/` | Two-tier skill selection: deterministic eligibility filter + evidence-based ranker | `SkillRouter` |
+| `planning_council/` | Multi-plan synthesis across parallel plan/critique nodes | — |
 | `llm_client.py` | Legacy OpenAI-compatible HTTP client (pre-Anthropic SDK) | `ChatClient` |
+| `prompt_templates.py` | Structured JSON schemas for every LLM-facing node (planner, coder, reviewer, etc.) + system prompts | `PLAN_SCHEMAS`, `CODER_SCHEMAS`, `REVIEWER_SCHEMAS` |
+| `run.py` | Standalone CLI pipeline runner (no Electron/HTTP needed) | `main` |
 
 ## Module dependency rules
 
 - `storage/models.py` depends on NOTHING (zero imports from agent_engine)
+- `project_doctor/models.py` depends on NOTHING (zero imports from agent_engine)
 - `repo_intelligence/` can import `workspace`, `telemetry`, `debug_log`
 - `graph.py` can import everything — it's the integration layer
 - `claude_adapter.py` can import `telemetry`, `debug_log`, `storage/models`
-- `agent_loop.py` can import `storage/`, `debug_log`
+- `agent_loop.py`, `project_doctor/scanner.py`, `project_doctor/patcher.py` can import `storage/`, `debug_log`
 - Never import `graph` from other modules (circular)
 - `prompt_templates.py` is pure strings + schemas — no runtime deps
+- `agent_sdk_provider.py` depends only on `claude-agent-sdk` (no agent_engine deps)
+
+## Env var overrides
+
+| Variable | Purpose |
+|---|---|
+| `AGENT_ENGINE_STATE_DIR` | Override `.agent-state/` dir (default: cwd-relative) |
+| `AGENT_BYPASS_SAFE_COMMANDS` | Set to `1` to disable command allowlists (bypassPolicy/directWorkspaceMode auto-set it) |
+| `ANTHROPIC_API_KEY` | API key for Anthropic SDK + claude-agent-sdk |
+| `OPENHANDS_SUPPRESS_BANNER` | Set to `1` to hide the OpenHands SDK banner |
+| `AGENT_DISABLE_HW_ACCEL` | Set to `1` to disable GPU in Electron on broken drivers |
+| `AGENT_HEARTBEAT_SECONDS` | Heartbeat interval for durable execution leases (default 5s) |
 
 ## Skills (workflow methodology)
 
-14 skills in `skills/` adapted from obra/superpowers. Follow the workflow: brainstorming → writing-plans → TDD → subagent-driven-development → code-review → verification-before-completion → finishing-a-development-branch.
+15 skills in `skills/` adapted from obra/superpowers. Key ones:
+- brainstorming → writing-plans (specification before implementation)
+- test-driven-development (red-green-refactor)
+- subagent-driven-development (parallel agents for independent workstreams)
+- verification-before-completion (run the project's own checks before declaring done)
+- systematic-debugging (4-phase root cause before fix)
+- project-doctor (autonomous scan→plan→patch→verify on the current workspace)
+
+## Known issues / gotchas
+
+- `test_phase2_approval_flow.py` has 3 `@pytest.mark.slow` tests that run 4 full rework loops with real git worktrees. They hang on Windows due to `ntpath.realpath` junction recursion — skip by default via `addopts = "-m 'not slow'"` in pyproject.toml.
+- Temp dirs for test suite are redirected to `<repo>-pytest-tmp/` (repo parent) by `conftest.py` to avoid Windows %TEMP% orphans holding GBs of WAL files.
+- `_STORE_LOCK` in `durable_execution.py` is `RLock` (not `Lock`) because `prepare()` calls `get()` while holding the lock.
+- OpenHands Agent objects (`openhands_worker.py`) are Pydantic models with `frozen=True`; mutating `agent.mcp_config` is not allowed. The retry block creates a fresh `Agent()` instead.
 
 ## Python conventions
 
