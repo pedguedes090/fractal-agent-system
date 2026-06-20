@@ -25,8 +25,12 @@ class DeterministicWorkflowTests(unittest.TestCase):
             workflow.route(
                 "reviewer_decision",
                 {
+                    "has_result": False,
                     "worker_error": False,
                     "review_passed": False,
+                    "changes_required": False,
+                    "replan_required": False,
+                    "blocked": False,
                     "can_rework": False,
                 },
             ),
@@ -34,7 +38,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(workflow.route("execution_gate", {"auto_rework_granted": True}), "openhands_worker")
         self.assertEqual(workflow.route("execution_gate", {"auto_rework_granted": False}), "reporter_end")
-        self.assertEqual(workflow.limits["maxReworkAttempts"], 2)
+        self.assertEqual(workflow.limits["maxReworkAttempts"], 3)
         self.assertEqual(workflow.limits["maxAutoApprovalCycles"], 1)
 
     def test_explicit_context_route_excludes_global_history_and_secrets(self) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -14,8 +15,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _safe_abs(path: str | Path) -> Path:
+    # Path.resolve() invokes ntpath.realpath() on Windows, which can recurse
+    # through junctions and hang on workspaces containing OneDrive/Dropbox or
+    # nested git worktrees. abspath() + normpath() gives the same canonical
+    # form for our use without touching the filesystem.
+    return Path(os.path.normpath(os.path.abspath(os.path.expanduser(str(path)))))
+
+
 def control_plane_path(state_dir: str | Path) -> Path:
-    root = Path(state_dir).expanduser().resolve()
+    root = _safe_abs(state_dir)
     root.mkdir(parents=True, exist_ok=True)
     return root / CONTROL_PLANE_DB_NAME
 
@@ -34,6 +43,10 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                 raise
             time.sleep(0.05)
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA max_page_count = 2147483647")  # SQLite max — no hard cap
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA cache_size = -128000")  # 128MB cache
+    conn.execute("PRAGMA temp_store = MEMORY")  # keep temp objects off disk
 
 
 def migrate_legacy_tables(
@@ -41,8 +54,8 @@ def migrate_legacy_tables(
     legacy_path: str | Path,
     table_names: Iterable[str],
 ) -> bool:
-    target = Path(target_path).resolve()
-    legacy = Path(legacy_path).resolve()
+    target = _safe_abs(target_path)
+    legacy = _safe_abs(legacy_path)
     if target == legacy or not legacy.exists():
         return False
 

@@ -8,7 +8,9 @@ const DEFAULT_SETTINGS = {
   model: "gemini/gemini-3.1-flash-lite",
   apiKey: "",
   autoConfirmHumanGate: false,
-  directWorkspaceMode: true
+  directWorkspaceMode: true,
+  modelOverrides: {},
+  bypassPolicy: false
 };
 
 function ensureDir(dirPath) {
@@ -115,7 +117,9 @@ class SettingsStore {
       autoConfirmHumanGate: Boolean(nextSettings.autoConfirmHumanGate),
       directWorkspaceMode: Object.prototype.hasOwnProperty.call(nextSettings, "directWorkspaceMode")
         ? Boolean(nextSettings.directWorkspaceMode)
-        : Boolean(current.directWorkspaceMode)
+        : Boolean(current.directWorkspaceMode),
+      modelOverrides: nextSettings.modelOverrides || current.modelOverrides || {},
+      bypassPolicy: Boolean(nextSettings.bypassPolicy)
     };
     const finalSettings = {
       ...DEFAULT_SETTINGS,

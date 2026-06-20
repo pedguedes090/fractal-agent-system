@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from agent_engine.graph import _normalize_verification_result, _sanitize_review_claims, run_pipeline
 
 
@@ -100,6 +102,7 @@ class Phase2ApprovalFlowTests(unittest.TestCase):
         self.assertIn('"grantAdditionalAttempts": grant', graph)
         self.assertIn('f"{execution_id}:approval:"', graph)
 
+    @pytest.mark.slow
     def test_write_task_continues_without_container_using_policy_limited_host_fallback(self) -> None:
         old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as state_dir:
@@ -226,6 +229,7 @@ class Phase2ApprovalFlowTests(unittest.TestCase):
                 else:
                     os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
 
+    @pytest.mark.slow
     def test_rework_loop_stops_at_yaml_limit_and_emits_execution_gate(self) -> None:
         old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as state_dir:
@@ -315,8 +319,8 @@ class Phase2ApprovalFlowTests(unittest.TestCase):
 
                 self.assertEqual(result["humanGate"]["status"], "pending")
                 self.assertEqual(result["humanGate"]["kind"], "rework_limit")
-                self.assertEqual(result["humanGate"]["retryCount"], 3)
-                self.assertEqual(len(worker_calls), 3)
+                self.assertEqual(result["humanGate"]["retryCount"], 4)
+                self.assertEqual(len(worker_calls), 4)
                 self.assertEqual((repo / "app.py").read_text(encoding="utf-8"), "print('base')\n")
 
                 approved_payload = {
@@ -376,6 +380,7 @@ class Phase2ApprovalFlowTests(unittest.TestCase):
                 else:
                     os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
 
+    @pytest.mark.slow
     def test_auto_confirm_rework_never_returns_pending_human_gate(self) -> None:
         old_state_dir = os.environ.get("AGENT_ENGINE_STATE_DIR")
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as state_dir:

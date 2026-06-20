@@ -189,11 +189,17 @@ def _sanitize_mcp_server(
             return None
         path_like = any(separator in command_text for separator in ("/", "\\")) or command_text.startswith(".")
         if path_like:
-            resolved = _workspace_relative(root, command_text)
-            if not resolved or not resolved.exists():
-                emit("openhands_mcp", f"Ignored MCP server {name}: command must stay inside workspace and exist")
-                return None
-            sanitized["command"] = str(resolved)
+            # Allow an out-of-workspace absolute path ONLY when the user explicitly
+            # listed the exact command string in allowedCommands (e.g. auto-injected
+            # codebase-memory-mcp binary from %LOCALAPPDATA%\Programs\...).
+            if command_text in allowed_commands and Path(command_text).exists():
+                sanitized["command"] = command_text
+            else:
+                resolved = _workspace_relative(root, command_text)
+                if not resolved or not resolved.exists():
+                    emit("openhands_mcp", f"Ignored MCP server {name}: command must stay inside workspace and exist")
+                    return None
+                sanitized["command"] = str(resolved)
         elif command_text not in allowed_commands:
             emit("openhands_mcp", f"Ignored MCP server {name}: command {command_text} is not allowlisted")
             return None
@@ -332,6 +338,44 @@ def _load_plugin_sources(workspace: str, emit: Callable[[str, str], None]) -> li
     return plugins
 
 
+def _augment_with_codebase_memory(
+    root: Path,
+    raw: dict[str, Any] | None,
+    emit: Callable[[str, str], None],
+) -> dict[str, Any] | None:
+    """If codebase-memory-mcp binary is installed, auto-inject it into the MCP config.
+
+    Bypasses the workspace-relative path check (binary lives in the user's install dir)
+    by short-circuiting the sanitizer for this specific known-trusted server.
+    """
+    from . import codebase_memory  # local import — avoids circular at module load
+
+    cfg = codebase_memory.McpServerConfig.detect()
+    if cfg is None:
+        return raw
+    raw = dict(raw or {})
+    servers = dict(raw.get("mcpServers") or {})
+    if cfg.name in servers:
+        return raw  # user defined their own — respect it
+    servers[cfg.name] = cfg.as_mcp_server_entry()
+    raw["mcpServers"] = servers
+    trusted = list(raw.get("trustedServers") or [])
+    if cfg.name not in trusted:
+        trusted.append(cfg.name)
+        raw["trustedServers"] = trusted
+    allowed = list(raw.get("allowedCommands") or [])
+    if cfg.command not in allowed:
+        allowed.append(cfg.command)
+        raw["allowedCommands"] = allowed
+    # Best-effort: make sure the workspace is indexed so the MCP tools have data to query.
+    try:
+        codebase_memory.ensure_indexed(str(root))
+    except Exception:
+        pass
+    emit("openhands_mcp", f"Auto-injected codebase-memory-mcp from {cfg.command}")
+    return raw
+
+
 def _load_mcp_config(workspace: str, emit: Callable[[str, str], None]) -> dict[str, Any]:
     root = Path(workspace)
     try:
@@ -339,21 +383,25 @@ def _load_mcp_config(workspace: str, emit: Callable[[str, str], None]) -> dict[s
     except Exception as exc:
         emit("openhands_mcp", f"Ignored MCP config: {exc}")
         return {}
+    # Auto-augment with codebase-memory-mcp if available — even if no file exists.
+    raw = _augment_with_codebase_memory(root.resolve(), raw, emit)
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        emit("openhands_mcp", f"Ignored {config_path.name}: expected a JSON object")
+        emit("openhands_mcp", f"Ignored {config_path.name if config_path else 'config'}: expected a JSON object")
         return {}
     sanitized = _sanitize_mcp_config(root.resolve(), raw, emit)
     if not sanitized:
-        emit("openhands_mcp", f"No trusted MCP servers loaded from {config_path.relative_to(root)}")
+        source = config_path.relative_to(root) if config_path else "(auto-detected)"
+        emit("openhands_mcp", f"No trusted MCP servers loaded from {source}")
         return {}
     server_count = len(sanitized.get("mcpServers") or {})
-    emit("openhands_mcp", f"Loaded {server_count} trusted MCP server(s) from {config_path.relative_to(root)}")
+    source = config_path.relative_to(root) if config_path else "(auto-detected)"
+    emit("openhands_mcp", f"Loaded {server_count} trusted MCP server(s) from {source}")
     write_debug_event(
         "openhands.mcp_loaded",
         {
-            "configPath": str(config_path.relative_to(root)),
+            "configPath": str(source),
             "serverNames": sorted((sanitized.get("mcpServers") or {}).keys()),
         },
     )
@@ -675,7 +723,41 @@ def run_openhands_worker(
                     if resume_conversation:
                         emit("coder_agent", f"Resuming persisted OpenHands conversation {conversation_id}")
                     else:
-                        conversation.send_message(task)
+                        try:
+                            conversation.send_message(task)
+                        except Exception as mcp_exc:
+                            # codebase-memory-mcp binary may fail MCP handshake
+                            # (v0.8.1 parse error on initialize). Retry once
+                            # without MCP tools so the coder can still work.
+                            if (
+                                not is_transient_error(mcp_exc)
+                                and bool(agent.mcp_config.get("mcpServers"))
+                                and (worker_attempt == 1 or not resume_conversation)
+                            ):
+                                _mcp_server_names = sorted((agent.mcp_config.get("mcpServers") or {}).keys())
+                                emit(
+                                    "openhands_mcp",
+                                    f"MCP init failed; retrying without MCP tools "
+                                    f"(servers: {_mcp_server_names}, error: {str(mcp_exc)[:200]})",
+                                )
+                                agent = Agent(
+                                    llm=llm, condenser=condenser, mcp_config={},
+                                    tool_concurrency_limit=1, tools=tools,
+                                )
+                                conversation = Conversation(
+                                    agent=agent,
+                                    workspace=sandbox_workspace,
+                                    plugins=plugins or None,
+                                    persistence_dir=persistence_dir,
+                                    conversation_id=conversation_id,
+                                    callbacks=[on_event],
+                                    max_iteration_per_run=80,
+                                    visualizer=None,
+                                    delete_on_close=False,
+                                )
+                                conversation.send_message(task)
+                            else:
+                                raise
                     run_result = conversation.run()
             except Exception as exc:
                 if is_transient_error(exc):

@@ -4,6 +4,7 @@ import os
 import json
 import operator
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable, TypedDict
 
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import StateGraph
 
@@ -53,6 +55,7 @@ from .workspace import (
     run_setup_commands,
     trusted_context,
 )
+from .repo_intelligence import ContextPack, RepoIntelligenceAgent
 from .worktree_manager import cleanup_execution_worktree, merge_execution_worktree, prepare_execution_worktree
 
 
@@ -76,6 +79,9 @@ class PipelineState(TypedDict, total=False):
     codegraphContext: dict[str, Any]
     longTermMemory: dict[str, Any]
     trustedRepoContext: dict[str, Any]
+    repoIntelligence: dict[str, Any]
+    analysisConfidence: float
+    analysisQualityGate: dict[str, Any]
     intakeFindings: Annotated[list[dict[str, Any]], operator.add]
     problem: dict[str, Any]
     candidatePlans: Annotated[list[dict[str, Any]], operator.add]
@@ -104,15 +110,24 @@ class PipelineState(TypedDict, total=False):
     reviewFindings: Annotated[list[dict[str, Any]], operator.add]
     latestReview: dict[str, Any]
     result: dict[str, Any]
+    # Doctor feedback — findings accumulated from auto-fix passes
+    doctorFindings: Annotated[list[dict[str, Any]], operator.add]
+    doctorStatus: dict[str, Any]
+    # Revision & rework tracking
+    revision: int
+    reviewCycle: int
+    revisionHistory: Annotated[list[dict[str, Any]], operator.add]
 
 
-def _client(state: PipelineState) -> ChatClient:
+def _client(state: PipelineState, role: str = "orchestrator") -> ChatClient:
     settings = {**state["settings"], **runtime_settings()}
-    return ChatClient(settings["serverUrl"], settings["model"], settings.get("apiKey", ""))
+    overrides = settings.get("modelOverrides") or {}
+    model = str(overrides.get(role) or settings["model"])
+    return ChatClient(settings["serverUrl"], model, settings.get("apiKey", ""))
 
 
-def _json(state: PipelineState, prompt: str, fallback: dict[str, Any]) -> dict[str, Any]:
-    return _client(state).json(prompt, fallback)
+def _json(state: PipelineState, prompt: str, fallback: dict[str, Any], role: str = "orchestrator") -> dict[str, Any]:
+    return _client(state, role).json(prompt, fallback)
 
 
 def _context(state: PipelineState, node_name: str) -> dict[str, Any]:
@@ -324,23 +339,87 @@ def _long_term_memory_context(workspace_path: str, task: str, trusted_repo_conte
         store.close()
 
 
+def _use_inmem_checkpointer() -> bool:
+    if os.environ.get("AGENT_TEST_INMEM") == "1":
+        return True
+    if os.environ.get("AGENT_FORCE_SQLITE_CHECKPOINT") == "1":
+        return False
+    return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+# ── In-memory cancel registry ───────────────────────────────────────────────
+# Pipeline cancellation is a process-local concern: the HTTP /v1/runs stream
+# and the LangGraph invoke loop run in the same backend process, so we don't
+# need to persist this. Callers mark an execution as cancelled; each agent
+# node checks at its boundary and raises CancelledExecution if so.
+_CANCELLED_EXECUTIONS: set[str] = set()
+_CANCEL_LOCK = threading.Lock()
+
+
+class CancelledExecution(Exception):
+    """Raised inside a pipeline node when the user requested cancel."""
+
+
+def request_cancel(execution_id: str) -> bool:
+    """Mark an execution as cancelled. Returns True if newly cancelled."""
+    if not execution_id:
+        return False
+    with _CANCEL_LOCK:
+        if execution_id in _CANCELLED_EXECUTIONS:
+            return False
+        _CANCELLED_EXECUTIONS.add(execution_id)
+    write_debug_event("pipeline.cancel.requested", {"executionId": execution_id})
+    return True
+
+
+def is_cancelled(execution_id: str) -> bool:
+    if not execution_id:
+        return False
+    with _CANCEL_LOCK:
+        return execution_id in _CANCELLED_EXECUTIONS
+
+
+def clear_cancel(execution_id: str) -> None:
+    if not execution_id:
+        return
+    with _CANCEL_LOCK:
+        _CANCELLED_EXECUTIONS.discard(execution_id)
+
+
 @contextmanager
 def _open_checkpointer(emit: Callable[[str, str], None]):
+    if _use_inmem_checkpointer():
+        checkpointer = InMemorySaver()
+        emit("checkpoint", "InMemory checkpointer ready (test mode)")
+        try:
+            yield checkpointer
+        finally:
+            pass
+        return
+
     state_dir = _state_dir()
-    db_path = control_plane_path(state_dir)
+    db_path = state_dir / "langgraph-checkpoints.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
     configure_connection(conn)
+    # Cap WAL growth: auto-checkpoint every ~4MB, hard-cap WAL file at 64MB after truncate.
+    # Without this, a long run can grow langgraph-checkpoints.sqlite-wal to many GB
+    # (observed: ~1GB/min under heavy step churn).
+    try:
+        conn.execute("PRAGMA wal_autocheckpoint = 1000")
+        conn.execute("PRAGMA journal_size_limit = 67108864")
+    except sqlite3.OperationalError:
+        pass
     checkpointer = SqliteSaver(conn)
     try:
         checkpointer.setup()
-        migrate_legacy_tables(
-            db_path,
-            state_dir / "langgraph-checkpoints.sqlite",
-            ("checkpoints", "writes"),
-        )
         emit("checkpoint", "SQLite checkpointer ready")
         yield checkpointer
     finally:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
         conn.close()
 
 
@@ -672,6 +751,12 @@ def _normalize_worker_task_spec(final: dict[str, Any], state: PipelineState) -> 
         ]
     )
     spec["forbiddenPaths"] = list(dict.fromkeys(forbidden))
+    # Bypass policy: skip all permission gates when user enables bypassPolicy
+    if state.get("settings", {}).get("bypassPolicy") or state.get("settings", {}).get("directWorkspaceMode"):
+        spec["allowedFiles"] = ["**"]
+        spec["forbiddenPaths"] = []  # trust user — they asked to bypass
+        os.environ["AGENT_BYPASS_SAFE_COMMANDS"] = "1"
+        write_debug_event("plan.worker_spec_bypass", {"reason": "bypassPolicy or directWorkspaceMode enabled"})
     if _is_project_creation_task(state["task"], state["problem"]):
         stack = str(spec.get("projectStack") or _infer_project_stack(state["task"], spec, state.get("problem"))).strip().lower() or "generic"
         target = _project_creation_target(state["task"], stack, spec)
@@ -704,6 +789,26 @@ def _normalize_worker_task_spec(final: dict[str, Any], state: PipelineState) -> 
                 "targetProjectDir": spec.get("targetProjectDir"),
                 "projectRoot": spec.get("projectRoot"),
                 "verificationCwd": spec.get("verificationCwd"),
+                "allowedFiles": spec.get("allowedFiles"),
+                "verificationCommands": spec.get("verificationCommands"),
+            },
+        )
+    else:
+        # For existing-project modifications: default allowedFiles to ["**"]
+        # so the coder can edit any file. The forbiddenPaths list still
+        # blocks .git, .env, secrets, etc. LLM may suggest narrower scope
+        # but must not be the sole authority.
+        allowed = list(spec.get("allowedFiles") or [])
+        if not allowed:
+            allowed = ["**"]
+        spec["allowedFiles"] = allowed
+        commands = [command for command in (spec.get("verificationCommands") or []) if isinstance(command, str)]
+        if commands:
+            spec["verificationCommands"] = commands
+        write_debug_event(
+            "plan.worker_spec_normalized",
+            {
+                "modify_existing": True,
                 "allowedFiles": spec.get("allowedFiles"),
                 "verificationCommands": spec.get("verificationCommands"),
             },
@@ -755,6 +860,29 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             emit("codegraph_context", f"Skipped: {context.get('reason') or context.get('status')}")
         return {"codegraphContext": context}
 
+    def repo_intelligence_node(state: PipelineState) -> dict[str, Any]:
+        emit("repo_intelligence", "Running repository intelligence analysis (8 stages)")
+        agent = RepoIntelligenceAgent(
+            workspace=state["workspacePath"],
+            llm_client=_client(state),
+            emit=emit,
+        )
+        pack: ContextPack = agent.analyze(state["task"])
+        pack_dict = pack.to_dict()
+        emit("repo_intelligence", f"Analysis complete: confidence={pack.analysis_confidence:.2f}, "
+              f"evidence={len(pack.evidence)}, entrypoints={len(pack.entrypoints)}")
+        quality_gate = pack_dict.get("metadata", {}).get("quality_gate", {})
+        if quality_gate:
+            passing = [c["check"] for c in quality_gate.get("checks", []) if c.get("passed")]
+            failing = [c["check"] for c in quality_gate.get("checks", []) if not c.get("passed")]
+            emit("repo_intelligence", f"Quality gate: {len(passing)}/{len(passing) + len(failing)} checks passed"
+                 + (f"; failing: {', '.join(failing)}" if failing else " (all passed)"))
+        return {
+            "repoIntelligence": pack_dict,
+            "analysisConfidence": pack.analysis_confidence,
+            "analysisQualityGate": quality_gate,
+        }
+
     def intake_user_intent(state: PipelineState) -> dict[str, Any]:
         emit("intake_user_intent", "Read-only user intent")
         finding = _json(
@@ -805,6 +933,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 f"Read-only Planning Agent {name}: {focus}. Return JSON with name, rationale, steps[], filesToRead[], filesLikelyToEdit[], commandsToRun[], risks[].\n"
                 + json.dumps(_context(state, f"planning_{name}"), ensure_ascii=False),
                 {"name": name, "steps": [], "filesToRead": [], "filesLikelyToEdit": [], "commandsToRun": [], "risks": []},
+                role="planner",
             )
             return {"candidatePlans": [{"agent": name, **plan}]}
 
@@ -818,6 +947,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 f"Critique Layer {name}: {focus}. Return JSON with blockers[], warnings[], riskClass, acceptanceCriteria[], reviewFocus[], requiredCommands[].\n"
                 + json.dumps(_context(state, f"critique_{name}"), ensure_ascii=False),
                 {"blockers": [], "warnings": [], "riskClass": state["problem"].get("riskClass", "medium"), "acceptanceCriteria": [], "reviewFocus": [], "requiredCommands": []},
+                role="reviewer",
             )
             return {
                 "critiqueFindings": [
@@ -856,13 +986,14 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     "maxReworkAttempts": 1,
                 },
             },
+            role="planner",
         )
         final = _normalize_worker_task_spec(final, state)
         final["riskClass"] = _merge_risk(str(final.get("riskClass", "medium")), str(state["problem"].get("riskClass", "medium")))
         return {"finalPlan": final}
 
     def planner_task_graph(state: PipelineState) -> dict[str, Any]:
-        emit("planner_agent", "Task graph + role contracts")
+        emit("planner_task_graph", "Task graph + role contracts")
         task_graph = build_task_graph(state["task"], state["problem"], state["finalPlan"])
         task_graph["contextHandoff"] = {
             "task": state["task"],
@@ -898,7 +1029,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         }
 
     def researcher_context_agent(state: PipelineState) -> dict[str, Any]:
-        emit("researcher_agent", "Repository context ownership")
+        emit("researcher_context_agent", "Repository context ownership")
         handoff = (state.get("taskGraph") or {}).get("contextHandoff") or {}
         output = researcher_output(
             handoff.get("problem") or {},
@@ -923,7 +1054,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         return {"researcherContext": output, "brokerEvents": events}
 
     def governance_service(state: PipelineState) -> dict[str, Any]:
-        emit("governance", "Approval policy and sensitive action routing")
+        emit("governance_service", "Approval policy and sensitive action routing")
         handoff = (state.get("researcherContext") or {}).get("governanceHandoff") or {}
         decision = governance_decision(
             str(handoff.get("task") or state["task"]),
@@ -944,9 +1075,10 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         governance = state.get("governanceDecision") or {}
         risk = str(governance.get("riskClass", state.get("taskIntent", {}).get("riskClass", "medium")))
         auto_confirm = bool((state.get("settings") or {}).get("autoConfirmHumanGate"))
+        bypass_policy = bool((state.get("settings") or {}).get("bypassPolicy"))
         approval = state.get("humanGateApproval") or {}
         approved = str(approval.get("status") or "").lower() == "approved"
-        needs_approval = risk == "high" or bool(governance.get("needsApproval"))
+        needs_approval = (risk == "high" or bool(governance.get("needsApproval"))) and not bypass_policy
         if needs_approval and auto_confirm:
             emit("human_gate", "Auto-confirm enabled; gate passed")
             return {
@@ -1123,9 +1255,9 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         mode = (state.get("executionEnvironment") or {}).get("executionMode") or "container"
         direct_workspace = bool((state.get("executionEnvironment") or {}).get("directWorkspace"))
         if direct_workspace:
-            emit("coder_agent", "OpenHands coding worker operating directly in the opened workspace")
+            emit("openhands_worker", "OpenHands coding worker operating directly in the opened workspace")
         else:
-            emit("coder_agent", "OpenHands coding worker with container sandbox" if mode == "container" else "OpenHands coding worker with policy-limited host fallback")
+            emit("openhands_worker", "OpenHands coding worker with container sandbox" if mode == "container" else "OpenHands coding worker with policy-limited host fallback")
         setup_results = list(state.get("setupCommandResults") or [])
         setup_completed = bool(state.get("setupCommandsCompleted"))
         if direct_workspace and not setup_completed:
@@ -1147,10 +1279,12 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     _context(state, "openhands_worker"),
                 )
                 subtask_id = subtask["id"]
+        overrides = state["settings"].get("modelOverrides") or {}
+        coder_model = str(overrides.get("coder") or state["settings"]["model"])
         worker_result = run_openhands_worker(
             workspace=state["workspacePath"],
             server_url=state["settings"]["serverUrl"],
-            model=state["settings"]["model"],
+            model=coder_model,
             api_key=runtime_settings().get("apiKey", ""),
             worker_task_spec={
                 **spec,
@@ -1281,6 +1415,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 ensure_ascii=False,
             ),
             {"blockers": [], "warnings": [], "passed": True, "finalMessage": ""},
+            role="reviewer",
         )
         review = _sanitize_review_claims(review, environment, command_results)
         if not use_container and not direct_workspace:
@@ -1330,7 +1465,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         return {"testerResult": tester_result, "brokerEvents": events}
 
     def security_reviewer_agent(state: PipelineState) -> dict[str, Any]:
-        emit("security_reviewer", "Security and policy review")
+        emit("security_reviewer_agent", "Security and policy review")
         latest = state["workerAttempts"][-1]
         fallback = security_review_fallback(state["problem"], latest, state.get("testerResult") or {}, state.get("governanceDecision") or {})
         review = _json(
@@ -1340,6 +1475,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             "Return JSON with blockers[], warnings[], riskClass, reviewFocus[], passed boolean.\n"
             + json.dumps(_context(state, "security_reviewer_agent"), ensure_ascii=False),
             fallback,
+            role="reviewer",
         )
         environment = state.get("executionEnvironment") or {}
         review = _sanitize_review_claims(
@@ -1363,7 +1499,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         return {"securityReview": review, "brokerEvents": events}
 
     def code_reviewer_agent(state: PipelineState) -> dict[str, Any]:
-        emit("code_reviewer", "Correctness and merge readiness")
+        emit("code_reviewer_agent", "Correctness and merge readiness")
         fallback = code_review_fallback(state.get("testerResult") or {}, state.get("securityReview") or {})
         review = _json(
             state,
@@ -1373,6 +1509,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             "Return JSON with blockers[], warnings[], passed boolean, finalMessage.\n"
             + json.dumps(_context(state, "code_reviewer_agent"), ensure_ascii=False),
             fallback,
+            role="reviewer",
         )
         review = _sanitize_review_claims(
             review,
@@ -1392,6 +1529,66 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 events = broker.events(run_id)
         return {"codeReview": review, "brokerEvents": events}
 
+    def doctor_feedback(state: PipelineState) -> dict[str, Any]:
+        """Run Project Doctor on the workspace and feed structured findings back.
+
+        The doctor operates on the current workspace state (including any files
+        the coder already touched). It runs scan→plan→patch→verify inside the
+        pipeline so findings are visible to reviewer_decision and execution_gate
+        without needing the user to press a button in the Doctor tab.
+
+        Every issue the doctor can fix deterministically is fixed immediately
+        (gitignore drift, lockfile resync). Issues needing the LLM receive a
+        streamed patch via the same Anthropic client the pipeline already uses.
+        The verify phase re-runs the project's own check commands so the
+        reviewer can see whether the pipeline state improved after the fix.
+        """
+        emit("doctor_feedback", "Running autonomous fix loop on the workspace")
+        workspace = str(Path(state["workspacePath"]).resolve())
+        provider: Any = None
+        try:
+            from .claude_adapter import ClaudeConfig, ClaudeProvider
+            cfg = ClaudeConfig(
+                api_key=((state.get("settings") or {}).get("apiKey") or os.environ.get("ANTHROPIC_API_KEY", "")),
+                model=((state.get("settings") or {}).get("model") or os.environ.get("ANTHROPIC_MODEL") or "claude-opus-4-8"),
+            )
+            if cfg.api_key:
+                provider = ClaudeProvider(cfg)
+        except Exception:
+            pass
+        try:
+            from .project_doctor import run_doctor
+            doctor_result = run_doctor(workspace, provider=provider, emit=emit)
+        except Exception as exc:
+            emit("doctor_feedback", f"Doctor pipeline failed: {exc}")
+            return {
+                "doctorFindings": [{
+                    "error": str(exc),
+                    "scan": {"issues": []},
+                    "fix": {"applied": [], "skipped": []},
+                    "verify": {"ok": False, "runs": []},
+                }],
+            }
+        scan = doctor_result.get("scan") or {}
+        fix = doctor_result.get("fix") or {}
+        verify = doctor_result.get("verify") or {}
+        ok = bool(doctor_result.get("ok"))
+        issues_count = len(scan.get("issues") or [])
+        applied = len(fix.get("applied") or [])
+        skipped = len(fix.get("skipped") or [])
+        emit("doctor_feedback", f"{issues_count} issue · {applied} fix · {skipped} skip · verify {'PASS' if ok else 'FAIL'}")
+        return {
+            "doctorFindings": [doctor_result],
+            "doctorStatus": {
+                "ok": ok,
+                "issuesCount": issues_count,
+                "applied": applied,
+                "skipped": skipped,
+                "verificationPassed": ok,
+                "scannedAt": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
     def release_deploy_agent(state: PipelineState) -> dict[str, Any]:
         emit("release_deploy_agent", "Release and rollback plan")
         latest = state["workerAttempts"][-1] if state.get("workerAttempts") else {}
@@ -1410,8 +1607,15 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         emit("reviewer_decision", "Merge or rollback decision")
         decision = aggregate_reviewer_decision(state.get("testerResult") or {}, state.get("securityReview") or {}, state.get("codeReview") or {}, state.get("releasePlan") or {})
         latest = state["workerAttempts"][-1] if state.get("workerAttempts") else {}
+        revision = int(state.get("revision", 0)) + 1
+        review_cycle = int(state.get("reviewCycle", 0)) + 1
+        verdict = str(decision.get("verdict", "approved"))
+        emit("reviewer_decision", f"Verdict: {verdict} (revision {revision}, cycle {review_cycle})")
         review = {
             **decision,
+            "verdict": verdict,
+            "revision": revision,
+            "reviewCycle": review_cycle,
             "commandResults": (state.get("testerResult") or {}).get("commandResults", []),
             "codegraphAffectedTests": (state.get("testerResult") or {}).get("codegraphAffectedTests", {}),
             "securityReview": state.get("securityReview"),
@@ -1424,12 +1628,54 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         if latest.get("error"):
             review.setdefault("blockers", []).append(f"Coder agent error: {latest['error']}")
             review["passed"] = False
+            review["verdict"] = "changes_required"
+        # Doctor feedback: if the doctor ran, upgraded the workspace, and its
+        # verify step passed, then *new* blockers that appeared after a prior
+        # review iteration may already be fixed — downgrade them to warnings.
+        doctor = state.get("doctorStatus") or {}
+        if doctor.get("issuesCount", 0) > 0:
+            review["doctorEvidence"] = {
+                "issuesCount": doctor.get("issuesCount", 0),
+                "applied": doctor.get("applied", 0),
+                "skipped": doctor.get("skipped", 0),
+                "verificationPassed": doctor.get("verificationPassed", False),
+                "doctorFindings": state.get("doctorFindings", []),
+            }
+            if doctor.get("verificationPassed") and doctor.get("applied", 0) > 0:
+                # Project's own checks pass after doctor fixes; enough to clear
+                # hygiene-level blockers (syntax, deps, lint) and treat them as
+                # informational. Architecture/replan blockers still stand.
+                hygiene_relief = {
+                    "syntax", "syntax error", "missing dependency", "lockfile",
+                    ".gitignore", "python syntax", "js syntax", "dep lock drift",
+                }
+                prior_blockers = list(map(str, review.get("blockers") or []))
+                review["blockers"] = [
+                    b for b in prior_blockers
+                    if not any(signal in b.lower() for signal in hygiene_relief)
+                ]
+                downgraded = [b for b in prior_blockers if b not in review["blockers"]]
+                if downgraded:
+                    review.setdefault("warnings", []).extend(
+                        f"[doctor: fixed] {item}" for item in downgraded
+                    )
+                    emit("reviewer_decision", f"Doctor relief: {len(downgraded)} blocker(s) → warning")
+                if not review.get("blockers"):
+                    review["passed"] = True
+                    review["verdict"] = "approved"
+        # Save plan to revision history before overwriting on replan
+        prior_plan = state.get("finalPlan")
+        if prior_plan and verdict == "replan_required":
+            review["priorPlanSnapshot"] = dict(prior_plan)
         run_id = state.get("brokerRunId")
         events = state.get("brokerEvents", [])
         if run_id:
             with _open_broker() as broker:
-                broker.record_event(run_id, None, "reviewer", "reviewer_decision", {"passed": review.get("passed"), "blockers": review.get("blockers", [])})
-                retry_limit = int(state.get("retryLimit", DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 2)))
+                broker.record_event(run_id, None, "reviewer", "reviewer_decision", {
+                    "passed": review.get("passed"), "verdict": verdict,
+                    "blockers": review.get("blockers", []), "revision": revision,
+                })
+                retry_limit = int(state.get("retryLimit", DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 3)))
                 will_rework = bool(review.get("blockers")) and state.get("retryCount", 0) <= retry_limit
                 auto_confirm = bool((state.get("settings") or {}).get("autoConfirmHumanGate"))
                 auto_cycle_limit = int(DEFAULT_WORKFLOW.limits.get("maxAutoApprovalCycles", 1))
@@ -1445,7 +1691,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 broker.finish_run(
                     run_id,
                     status,
-                    {"passed": review.get("passed"), "willRework": will_rework, "needsExecutionGate": needs_gate},
+                    {"passed": review.get("passed"), "verdict": verdict, "willRework": will_rework, "needsExecutionGate": needs_gate, "revision": revision},
                 )
                 events = broker.events(run_id)
                 review["brokerEvents"] = events
@@ -1455,6 +1701,9 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             "reviewFindings": [review],
             "brokerEvents": events,
             "autoReworkGranted": False,
+            "revision": revision,
+            "reviewCycle": review_cycle,
+            "revisionHistory": [review],
         }
 
     def execution_gate(state: PipelineState) -> dict[str, Any]:
@@ -1620,24 +1869,36 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
 
     def route_facts(_node_name: str, state: PipelineState) -> dict[str, Any]:
         review = state.get("latestReview") or {}
+        tester_result = state.get("testerResult") or {}
         attempts = state.get("workerAttempts") or []
+        verdict = str(review.get("verdict") or "approved")
+        review_passed = verdict == "approved" and not review.get("blockers")
         blockers = list(review.get("blockers") or [])
         retry_count = int(state.get("retryCount", 0))
-        retry_limit = int(state.get("retryLimit", DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 2)))
+        retry_limit = int(state.get("retryLimit", DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 3)))
         return {
             "has_result": bool(state.get("result")),
             "read_only": _is_read_only(state["task"], state.get("problem") or {}, state.get("taskIntent")),
             "worker_error": bool(attempts and attempts[-1].get("error")),
-            "review_passed": bool(review.get("passed")) and not blockers,
-            "can_rework": bool(blockers) and retry_count <= retry_limit,
+            "review_passed": review_passed,
+            "changes_required": verdict == "changes_required",
+            "replan_required": verdict == "replan_required",
+            "blocked": verdict == "blocked",
+            "can_rework": bool(blockers) and retry_count <= retry_limit and verdict in {"changes_required", "replan_required"},
+            "can_replan": verdict == "replan_required" and retry_count <= retry_limit,
+            "tester_failed": not bool(tester_result.get("passed")) and not bool(attempts and attempts[-1].get("error")),
             "retry_count": retry_count,
             "retry_limit": retry_limit,
             "auto_rework_granted": bool(state.get("autoReworkGranted")),
+            "doctor_ran": bool(state.get("doctorStatus")),
+            "doctor_passed": bool((state.get("doctorStatus") or {}).get("verificationPassed")),
+            "doctor_issues": int((state.get("doctorStatus") or {}).get("issuesCount") or 0),
         }
 
     agent_roles = {
         "preflight": "orchestrator",
         "codegraph_context": "researcher_context",
+        "repo_intelligence": "researcher_context",
         "intake_user_intent": "intake",
         "intake_ambiguity": "intake",
         "intake_repo_context": "intake",
@@ -1660,6 +1921,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         "tester_agent": "tester",
         "security_reviewer_agent": "security_reviewer",
         "code_reviewer_agent": "code_reviewer",
+        "doctor_feedback": "doctor",
         "release_deploy_agent": "release_deploy",
         "reviewer_decision": "reviewer",
         "execution_gate": "governance",
@@ -1671,11 +1933,20 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
     def traced_node(node_name: str, fn: Callable[[PipelineState], dict[str, Any]]):
         def wrapped(state: PipelineState) -> dict[str, Any]:
             telemetry.set_correlation_id(state.get("correlationId"))
+            execution_id = str(state.get("executionId", ""))
+            if is_cancelled(execution_id):
+                emit(node_name, f"Pipeline cancelled before {node_name}")
+                write_debug_event("pipeline.cancel.honored", {
+                    "executionId": execution_id, "node": node_name,
+                })
+                raise CancelledExecution(f"Execution {execution_id} cancelled by user before {node_name}")
+            # Emit node_start so flowView + exec tab can track lifecycle
+            emit(node_name, f"Node {node_name} bắt đầu")
             step_input = {
                 "node": node_name,
                 "role": agent_roles.get(node_name, "agent"),
                 "sessionId": state.get("sessionId", ""),
-                "executionId": state.get("executionId", ""),
+                "executionId": execution_id,
                 "brokerRunId": state.get("brokerRunId", ""),
             }
             with checkpoint_step("agent_node", node_name, step_input) as durable_step:
@@ -1692,6 +1963,8 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 ):
                     output = fn(state)
                     durable_step.set_output(output)
+                    # Emit node_end for lifecycle tracking
+                    emit(node_name, f"Node {node_name} hoàn tất")
                     return output
 
         return wrapped
@@ -1699,6 +1972,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
     builder = StateGraph(PipelineState)
     builder.add_node("preflight", traced_node("preflight", preflight))
     builder.add_node("codegraph_context", traced_node("codegraph_context", codegraph_context_node))
+    builder.add_node("repo_intelligence", traced_node("repo_intelligence", repo_intelligence_node))
     builder.add_node("intake_user_intent", traced_node("intake_user_intent", intake_user_intent))
     builder.add_node("intake_ambiguity", traced_node("intake_ambiguity", intake_ambiguity))
     builder.add_node("intake_repo_context", traced_node("intake_repo_context", intake_repo_context))
@@ -1721,6 +1995,7 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
     builder.add_node("tester_agent", traced_node("tester_agent", tester_agent))
     builder.add_node("security_reviewer_agent", traced_node("security_reviewer_agent", security_reviewer_agent))
     builder.add_node("code_reviewer_agent", traced_node("code_reviewer_agent", code_reviewer_agent))
+    builder.add_node("doctor_feedback", traced_node("doctor_feedback", doctor_feedback))
     builder.add_node("release_deploy_agent", traced_node("release_deploy_agent", release_deploy_agent))
     builder.add_node("reviewer_decision", traced_node("reviewer_decision", reviewer_decision_node))
     builder.add_node("execution_gate", traced_node("execution_gate", execution_gate))
@@ -1765,6 +2040,10 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
     retry_limit = int(DEFAULT_WORKFLOW.limits.get("maxReworkAttempts", 2))
     if approval_granted and approval_kind == "rework_limit":
         retry_limit = previous_retry_count + configured_grant - 1
+    # Bypass policy + direct-workspace mode: skip verification/setup allowlist so
+    # the project owner's own tools (flutter, pip, etc.) just run.
+    if settings.get("bypassPolicy") or settings.get("directWorkspaceMode"):
+        os.environ["AGENT_BYPASS_SAFE_COMMANDS"] = "1"
     source_workspace = str(Path(payload["workspacePath"]).resolve())
     state: PipelineState = {
         "task": payload["content"],
@@ -1783,14 +2062,8 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
         "correlationId": correlation_id,
     }
     state_dir = _state_dir()
-    durable_db_path = control_plane_path(state_dir)
-    supervisor = DurableExecutionStore(durable_db_path)
+    supervisor = DurableExecutionStore()
     try:
-        migrate_legacy_tables(
-            durable_db_path,
-            state_dir / "durable-executions.sqlite",
-            ("durable_executions", "durable_steps"),
-        )
         execution = supervisor.prepare(
             execution_id=execution_id,
             session_id=state["sessionId"],
@@ -1847,8 +2120,8 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
     started_ms = telemetry.now_ms()
     result: PipelineState
     try:
-        with execution_context(execution_id=execution_id, database_path=durable_db_path, runtime_settings=settings):
-            with ExecutionHeartbeat(durable_db_path, execution_id, lease_owner):
+        with execution_context(execution_id=execution_id, database_path=state_dir, runtime_settings=settings):
+            with ExecutionHeartbeat(state_dir, execution_id, lease_owner):
                 with telemetry.start_span(
                     "agent.task",
                     {
@@ -1928,12 +2201,27 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
             "problem": result.get("problem"),
             "taskIntent": result.get("taskIntent"),
             "codegraphContext": result.get("codegraphContext"),
+            "repoIntelligence": result.get("repoIntelligence"),
             "longTermMemory": result.get("longTermMemory"),
             "trustedRepoContext": result.get("trustedRepoContext"),
             "intake": result.get("intakeFindings", []),
             "plans": result.get("candidatePlans", []),
             "critiques": result.get("critiqueFindings", []),
             "finalPlan": result.get("finalPlan"),
+            # Surface review/execution data the UI tabs directly read
+            "codeReview": result.get("codeReview"),
+            "securityReview": result.get("securityReview"),
+            "releaseDeployPlan": result.get("releasePlan"),
+            "releasePlan": result.get("releasePlan"),
+            "testerResult": result.get("testerResult"),
+            "latestReview": result.get("latestReview"),
+            "reviewerDecision": result.get("reviewerDecision"),
+            "governanceDecision": result.get("governanceDecision"),
+            "executionEnvironment": result.get("executionEnvironment"),
+            "brokerEvents": result.get("brokerEvents", []),
+            "intakeFindings": result.get("intakeFindings", []),
+            "progressEvents": result.get("progressEvents", []),
+            # Any nested result from reporter / execution_gate / read_only_reporter
             **(result.get("result") or {}),
             "tokenUsage": telemetry.get_token_usage(),
             "task": state["task"],
@@ -1943,7 +2231,28 @@ def run_pipeline(payload: dict[str, Any], emit: Callable[[str, str], None]) -> d
         supervisor.complete(execution_id, response, durable_status)
         return response
     except Exception as exc:
+        # LangGraph wraps node-raised exceptions. Treat anything that fired
+        # while the execution was cancelled as a clean stop.
+        if isinstance(exc, CancelledExecution) or is_cancelled(execution_id):
+            emit("cancelled", "Pipeline đã được dừng theo yêu cầu")
+            cancelled_response = {
+                "id": execution_id,
+                "executionId": execution_id,
+                "correlationId": correlation_id,
+                "task": state["task"],
+                "status": "cancelled",
+                "cancelled": True,
+                "reason": "user_cancelled",
+                "finalMessage": "Pipeline đã được dừng theo yêu cầu.",
+                "tokenUsage": telemetry.get_token_usage(),
+            }
+            try:
+                supervisor.complete(execution_id, cancelled_response, "cancelled")
+            except Exception:
+                pass
+            return cancelled_response
         supervisor.mark_recoverable(execution_id, exc)
         raise
     finally:
+        clear_cancel(execution_id)
         supervisor.close()

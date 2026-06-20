@@ -13,7 +13,23 @@ dependencies = [
   "openhands-sdk>=1.28.1",
   "openhands-tools>=1.28.1",
   "pyyaml>=6.0.3",
+  "claude-agent-sdk>=0.2.0",
 ]
 
+[tool.setuptools.packages.find]
+where = ["engine"]
+
+[tool.pytest.ini_options]
+markers = [
+    "real_sqlite: Test needs real SQLite persistence; skips AGENT_TEST_INMEM=1.",
+    "slow: Heavy end-to-end pipeline test; skipped locally, runs in CI.",
+]
+# Exclude slow integration tests by default — they boot the full LangGraph
+# pipeline through 4 rework loops with real git worktrees and copytree
+# sandboxes, which takes minutes on Windows and can hang on junction
+# recursion. Run them explicitly with `pytest -m slow` in CI.
+addopts = "-m 'not slow'"
+
 [tool.uv]
-package = false
+package = true
+source = "engine"

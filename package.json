@@ -9,7 +9,7 @@
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
-    "check": "node --check src/main/main.js && node --check src/main/preload.js && node --check src/main/appDatabase.js && node --check src/main/pythonRuntime.js && node --check src/main/backendService.js && node --check src/main/pythonEngine.js && node --check src/main/sessionStore.js && node --check src/main/settingsStore.js && node --check src/renderer/app.js && node --check scripts/compile-python.js && node --check scripts/run-evaluation.js && node --check scripts/run-tests.js && node scripts/compile-python.js && node scripts/run-evaluation.js validate && node scripts/run-tests.js",
+    "check": "node --check src/main/main.js && node --check src/main/preload.js && node --check src/main/appDatabase.js && node --check src/main/pythonRuntime.js && node --check src/main/backendService.js && node --check src/main/pythonEngine.js && node --check src/main/sessionStore.js && node --check src/main/settingsStore.js && node --check src/main/workspaceDiff.js && node --check src/renderer/app.js && node --check src/renderer/flowView.js && node --check scripts/compile-python.js && node --check scripts/run-evaluation.js && node --check scripts/run-tests.js && node --test tests/test_workspace_diff.js && node scripts/compile-python.js && node scripts/run-evaluation.js validate && node scripts/run-tests.js",
     "test": "node scripts/run-tests.js",
     "eval:validate": "node scripts/run-evaluation.js validate",
     "eval:smoke": "node scripts/run-evaluation.js run --mode mock",

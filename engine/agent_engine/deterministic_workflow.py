@@ -101,8 +101,8 @@ class DeterministicWorkflow:
             raise WorkflowConfigError(f"Node {node_name} has no deterministic route.")
         for raw_case in config.get("cases") or []:
             expression = str(raw_case["when"])
-            evaluator = self._environment.compile_expression(expression, undefined_to_none=False)
-            if bool(evaluator(**facts)):
+            evaluator = self._environment.compile_expression(expression, undefined_to_none=True)
+            if evaluator(**facts):
                 return str(raw_case["target"])
         return str(config["default"])
 

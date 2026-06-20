@@ -186,8 +186,24 @@ def reviewer_decision(tester_result: dict[str, Any], security_review: dict[str, 
     if release_plan.get("needsApproval"):
         warnings.append("Release/deploy agent requires manual approval before deploy.")
     passed = not blockers and bool(code_review.get("passed", True))
+
+    # Structured verdict — determines graph routing
+    if not blockers:
+        verdict = "approved"
+    elif any(
+        signal in str(blocker).lower()
+        for signal in ["architecture", "replan", "design", "redesign", "wrong approach", "kiến trúc", "thiết kế lại", "làm lại"]
+        for blocker in blockers
+    ):
+        verdict = "replan_required"
+    elif release_plan.get("needsApproval") and not passed:
+        verdict = "blocked"
+    else:
+        verdict = "changes_required"
+
     return {
         "passed": passed,
+        "verdict": verdict,
         "blockers": list(dict.fromkeys(blockers)),
         "warnings": list(dict.fromkeys(warnings)),
         "finalMessage": code_review.get("finalMessage") or "Reviewer decision complete.",

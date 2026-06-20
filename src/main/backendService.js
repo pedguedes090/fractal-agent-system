@@ -178,7 +178,12 @@ class AgentBackendService {
           emitProgress({
             stage: message.stage,
             detail: message.detail,
-            at: message.at
+            at: message.at,
+            executionId: message.executionId || executionId,
+            correlationId: message.correlationId || correlationId,
+            sessionId: message.sessionId || sessionId,
+            node: message.node || null,
+            eventType: message.eventType || "progress"
           });
         }
         if (message.type === "result") result = message.result;
@@ -207,6 +212,51 @@ class AgentBackendService {
     };
   }
 
+  async runDoctor({ workspacePath, sessionId, apiKey, model, emitEvent }) {
+    const endpoint = await this.start();
+    const response = await fetch(`${endpoint}/v1/doctor`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspacePath, sessionId, apiKey, model })
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`Doctor backend loi ${response.status}: ${body.slice(0, 800)}`);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalResult = null;
+    let engineError = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const message = parseJsonLine(line);
+        if (!message) continue;
+        if (typeof emitEvent === "function") emitEvent(message);
+        if (message.type === "doctor.result") {
+          finalResult = message.result || null;
+          if (message.error) engineError = message.error;
+        }
+      }
+    }
+    if (buffer.trim()) {
+      const message = parseJsonLine(buffer.trim());
+      if (message && typeof emitEvent === "function") emitEvent(message);
+      if (message?.type === "doctor.result") {
+        finalResult = message.result || finalResult;
+        if (message.error) engineError = message.error;
+      }
+    }
+    if (!finalResult) throw new Error(engineError || "Doctor khong tra ve ket qua.");
+    return finalResult;
+  }
+
   async getObservability() {
     const endpoint = await this.start();
     const response = await fetch(`${endpoint}/v1/observability`);
@@ -223,6 +273,31 @@ class AgentBackendService {
     if (!response.ok) {
       const body = await response.text().catch(() => "");
       throw new Error(`Agent backend autonomy status loi ${response.status}: ${body.slice(0, 800)}`);
+    }
+    return response.json();
+  }
+
+  async getTopology() {
+    const endpoint = await this.start();
+    const response = await fetch(`${endpoint}/v1/topology`);
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`Agent backend topology loi ${response.status}: ${body.slice(0, 800)}`);
+    }
+    return response.json();
+  }
+
+  async cancelRun(executionId) {
+    if (!executionId) return { ok: false, error: "no executionId" };
+    const endpoint = await this.start();
+    const response = await fetch(`${endpoint}/v1/runs/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ executionId }),
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      return { ok: false, error: `cancel ${response.status}: ${body.slice(0, 300)}` };
     }
     return response.json();
   }

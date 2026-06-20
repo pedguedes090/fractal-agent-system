@@ -2,13 +2,14 @@ version: 1
 name: dagent-secure-deterministic-v1
 
 limits:
-  maxReworkAttempts: 2
+  maxReworkAttempts: 3
   approvalGrantAttempts: 1
   maxAutoApprovalCycles: 1
 
 nodes:
   - preflight
   - codegraph_context
+  - repo_intelligence
   - intake_user_intent
   - intake_ambiguity
   - intake_repo_context
@@ -31,6 +32,7 @@ nodes:
   - tester_agent
   - security_reviewer_agent
   - code_reviewer_agent
+  - doctor_feedback
   - release_deploy_agent
   - reviewer_decision
   - execution_gate
@@ -41,6 +43,7 @@ nodes:
 edges:
   - [START, preflight]
   - [preflight, codegraph_context]
+  - [codegraph_context, repo_intelligence]
   - [intake_synthesizer, planning_minimal]
   - [intake_synthesizer, planning_robust]
   - [intake_synthesizer, planning_test_first]
@@ -52,7 +55,8 @@ edges:
   - [openhands_worker, tester_agent]
   - [tester_agent, security_reviewer_agent]
   - [security_reviewer_agent, code_reviewer_agent]
-  - [code_reviewer_agent, release_deploy_agent]
+  - [code_reviewer_agent, doctor_feedback]
+  - [doctor_feedback, release_deploy_agent]
   - [release_deploy_agent, reviewer_decision]
   - [read_only_reporter, finalize_workspace]
   - [reporter, finalize_workspace]
@@ -60,7 +64,7 @@ edges:
   - [reporter_end, END]
 
 fanOut:
-  codegraph_context:
+  repo_intelligence:
     - intake_user_intent
     - intake_ambiguity
     - intake_repo_context
@@ -94,12 +98,20 @@ routes:
 
   reviewer_decision:
     cases:
+      - when: has_result
+        target: reporter_end
       - when: worker_error
         target: reporter
-      - when: review_passed
-        target: reporter
+      - when: blocked
+        target: reporter_end
+      - when: replan_required
+        target: plan_arbiter
+      - when: changes_required
+        target: openhands_worker
       - when: can_rework
         target: openhands_worker
+      - when: review_passed
+        target: reporter
     default: execution_gate
 
   execution_gate:
@@ -109,14 +121,23 @@ routes:
     default: reporter_end
 
 contextRoutes:
+  repo_intelligence:
+    - task
+    - taskIntent
+    - preflight
+    - codegraphContext
+    - trustedRepoContext
+    - longTermMemory
   intake_user_intent:
     - task
     - taskIntent
     - preflight
+    - repoIntelligence
   intake_ambiguity:
     - task
     - taskIntent
     - preflight
+    - repoIntelligence
   intake_repo_context:
     - task
     - taskIntent
@@ -124,17 +145,22 @@ contextRoutes:
     - trustedRepoContext
     - codegraphContext
     - longTermMemory
+    - repoIntelligence
   intake_synthesizer:
     - intakeFindings
+    - repoIntelligence
   planning_minimal:
     - taskIntent
     - problem
+    - repoIntelligence
   planning_robust:
     - taskIntent
     - problem
+    - repoIntelligence
   planning_test_first:
     - taskIntent
     - problem
+    - repoIntelligence
   critique_risk:
     - candidatePlans
   critique_test_coverage:
@@ -143,6 +169,7 @@ contextRoutes:
     - candidatePlans
   plan_arbiter:
     - critiqueFindings
+    - repoIntelligence
   researcher_context_agent:
     - taskGraph
   governance_service:

@@ -313,15 +313,19 @@ class WorktreeContainerSecurityTests(unittest.TestCase):
                     os.environ["AGENT_ENGINE_STATE_DIR"] = old_state_dir
 
     def test_container_command_has_hardening_flags_and_no_network(self) -> None:
-        args = _container_command(
-            runtime="docker",
-            image="python:3.12-slim",
-            workspace=Path("C:/workspace"),
-            command="pytest",
-            cwd=".",
-            dependency_workspace=None,
-            allow_pull=False,
-        )
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "ws"
+            workspace.mkdir()
+            args = _container_command(
+                runtime="docker",
+                image="python:3.12-slim",
+                workspace=workspace,
+                command="pytest",
+                cwd=".",
+                dependency_workspace=None,
+                allow_pull=False,
+            )
         joined = " ".join(map(str, args))
         self.assertIn("--network none", joined)
         self.assertIn("--read-only", args)

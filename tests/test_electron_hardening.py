@@ -13,7 +13,10 @@ class ElectronHardeningTests(unittest.TestCase):
 
         self.assertIn("contextIsolation: true", main_js)
         self.assertIn("nodeIntegration: false", main_js)
-        self.assertIn("sandbox: true", main_js)
+        # sandbox must be false for preload.js (which uses Node require()) to work.
+        # Security is provided by contextIsolation + no nodeIntegration.
+        self.assertIn("sandbox: false", main_js)
+        self.assertIn("// must be false for preload to use Node require()", main_js)
 
     def test_settings_store_does_not_persist_raw_api_key_in_model_config(self) -> None:
         settings_js = (ROOT / "src" / "main" / "settingsStore.js").read_text(encoding="utf-8")
@@ -29,10 +32,12 @@ class ElectronHardeningTests(unittest.TestCase):
         preload_js = (ROOT / "src" / "main" / "preload.js").read_text(encoding="utf-8")
         main_js = (ROOT / "src" / "main" / "main.js").read_text(encoding="utf-8")
 
-        self.assertIn('class="dashboard-panel"', index_html)
+        self.assertIn('class="dashboard-main"', index_html)
         self.assertIn('id="dagBoard"', index_html)
-        self.assertIn('id="systemLogList"', index_html)
-        self.assertIn('id="autonomySummary"', index_html)
+        self.assertIn('id="logList"', index_html)
+        self.assertIn('id="ovStatus"', index_html)
+        self.assertIn("autonomySummary", app_js)
+        self.assertIn("dashboardMetrics", app_js)
         self.assertNotIn('class="chat-panel"', index_html)
         self.assertNotIn('id="messages"', index_html)
         self.assertNotIn("renderMessages", app_js)

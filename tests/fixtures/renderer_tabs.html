@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <title>Renderer tabs fixture</title>
+  <link rel="stylesheet" href="../../src/renderer/styles.css">
+</head>
+<body>
+  <div id="__bootstrap"></div>
+  <nav class="tab-bar">
+    <button class="tab active" data-tab="overview">Tổng quan</button>
+    <button class="tab" data-tab="analysis">Phân tích</button>
+    <button class="tab" data-tab="plan">Kế hoạch</button>
+    <button class="tab" data-tab="execution">Thực thi <span class="badge" id="execBadge" style="display:none">0</span></button>
+    <button class="tab" data-tab="review">Review <span class="badge" id="reviewBadge" style="display:none">0</span></button>
+    <button class="tab" data-tab="changes">Thay đổi <span class="badge" id="changesBadge" style="display:none">0</span></button>
+    <button class="tab" data-tab="log">Nhật ký</button>
+  </nav>
+  <main class="dashboard-main">
+    <section class="tab-content active" id="tab-overview">
+      <div id="ovStatus"></div><div id="ovTask"></div><div id="ovResult"></div><div id="ovStats"></div>
+    </section>
+    <section class="tab-content" id="tab-analysis">
+      <div id="anRequest"></div><div id="anEvidence"></div><div id="anImpact"></div><div id="anRisks"></div>
+    </section>
+    <section class="tab-content" id="tab-plan"><div id="planItems"></div><div id="planHistory"></div></section>
+    <section class="tab-content" id="tab-execution">
+      <strong id="execProgress"></strong><span id="execCurrent"></span><div id="execStream"></div><div id="execToolCalls"></div><div id="execTests"></div>
+    </section>
+    <section class="tab-content" id="tab-review">
+      <div class="review-subtabs">
+        <button class="subtab active" data-subtab="code">Code Review</button>
+        <button class="subtab" data-subtab="security">Security Review</button>
+        <button class="subtab" data-subtab="release">Release Gate</button>
+      </div>
+      <div id="reviewContent"></div>
+    </section>
+    <section class="tab-content" id="tab-changes">
+      <div class="changes-layout"><div id="changesFileList"></div><div id="changesDiffViewer"></div></div>
+    </section>
+    <section class="tab-content" id="tab-log">
+      <div class="log-controls">
+        <select id="logFilterNode"><option value="">Tất cả node</option></select>
+        <select id="logFilterType"><option value="">Tất cả loại</option></select>
+        <label><input type="checkbox" id="logToggleDebug"> Debug JSON</label>
+      </div>
+      <div id="logList"></div>
+    </section>
+  </main>
+  <script>
+    const fixtureRun = {
+      id: "run-fixture",
+      executionId: "exec-fixture",
+      task: "Sửa dashboard tabs",
+      assistantText: "Đã hoàn tất fixture.",
+      repoIntelligence: {
+        request_understanding: { goal: "Sửa dashboard tabs" },
+        evidence: [{ evidence_type: "function", claim: "Renderer tồn tại", file_path: "src/renderer/app.js", line_number: 1244 }],
+        change_impact_map: [{ level: "medium", target: "renderDashboard" }],
+        relevant_files: ["src/renderer/app.js"],
+        risks: ["Renderer cũ ghi đè DOM"],
+        unknowns: ["Run cũ có thể không lưu diff"],
+        analysis_confidence: 0.94
+      },
+      finalPlan: {
+        selectedPlanName: "robust",
+        finalSteps: ["Nối dữ liệu thật", "Test từng tab"],
+        riskClass: "medium",
+        workerTaskSpec: { allowedFiles: ["src/renderer/app.js"], acceptanceCriteria: ["Filter hoạt động"] }
+      },
+      plans: [{ name: "minimal", steps: ["Vá renderer"] }, { name: "robust", steps: ["Vá và test"] }],
+      progressEvents: [
+        { stage: "planning_robust", detail: "Lập kế hoạch", at: "2026-06-20T01:00:00Z" },
+        { stage: "openhands_worker", detail: "Sửa app.js", at: "2026-06-20T01:01:00Z" },
+        { stage: "tester_agent", detail: "Chạy tests", at: "2026-06-20T01:02:00Z" }
+      ],
+      commandResults: [{ command: "node --check src/renderer/app.js", code: 0 }],
+      review: {
+        passed: false,
+        blockers: ["Một blocker fixture"],
+        warnings: ["Một warning fixture"],
+        codeReview: { passed: true, finalMessage: "Code review đạt", blockers: [], warnings: [] },
+        securityReview: { passed: true, riskClass: "low", blockers: [], warnings: ["Kiểm tra IPC"] },
+        releasePlan: { needsApproval: false, releaseNotes: ["Ship renderer"], rollbackPlan: "Revert app.js" }
+      },
+      changedFiles: [
+        { path: "src/renderer/app.js", status: "modified" },
+        { path: "src/main/preload.js", status: "modified" }
+      ]
+    };
+    window.agentApp = {
+      async getInitialState() {
+        return {
+          settings: { serverUrl: "http://localhost:20128/v1", model: "fixture", modelOverrides: {} },
+          sessions: { sessions: [{ id: "fixture", title: "Fixture", workspacePath: "C:/fixture" }] },
+          activeSession: { id: "fixture", title: "Fixture", workspacePath: "C:/fixture", runs: [fixtureRun], messages: [] }
+        };
+      },
+      async saveSettings(value) { return value; },
+      async getObservability() { return { recentEvents: [{ eventType: "backend", stage: "server", detail: "Backend event", at: "2026-06-20T01:03:00Z" }] }; },
+      async getAutonomyStatus() { return {}; },
+      async getWorkspaceDiff(_sessionId, relativePath) { return { kind: "diff", diff: `--- a/${relativePath}\n+++ b/${relativePath}\n@@ -1 +1 @@\n-old\n+new` }; },
+      onProgress() { return () => {}; }
+    };
+  </script>
+  <script src="../../src/renderer/app.js"></script>
+</body>
+</html>

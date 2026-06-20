@@ -193,7 +193,11 @@ class OpenHandsWorkerCleanupTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            config = _load_mcp_config(str(root), lambda stage, detail: emitted.append((stage, detail)))
+            with mock.patch(
+                "agent_engine.codebase_memory.McpServerConfig.detect",
+                return_value=None,
+            ):
+                config = _load_mcp_config(str(root), lambda stage, detail: emitted.append((stage, detail)))
 
         self.assertEqual(set(config["mcpServers"].keys()), {"docs", "remoteOps"})
         self.assertNotIn("trusted", config["mcpServers"]["remoteOps"])

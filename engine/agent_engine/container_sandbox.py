@@ -120,6 +120,7 @@ def _container_command(
     dependency_workspace: Path | None,
     allow_pull: bool,
 ) -> list[str]:
+    workspace = workspace.resolve()
     raw_cwd = str(cwd or ".").replace("\\", "/").strip()
     if raw_cwd.startswith("/") or re.match(r"^[A-Za-z]:", raw_cwd):
         raise ValueError(f"Container cwd must be relative to the execution worktree: {cwd}")

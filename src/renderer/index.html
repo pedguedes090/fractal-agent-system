@@ -1,111 +1,221 @@
 <!doctype html>
 <html lang="vi">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>He Thong Agent</title>
-    <link rel="stylesheet" href="./styles.css" />
-  </head>
-  <body>
-    <div class="app-shell">
-      <header class="topbar">
-        <div class="brand">
-          <div class="brand-mark">A</div>
-          <div>
-            <h1>Hệ Thống Agent</h1>
-            <p id="workspaceLabel">Chưa mở thư mục</p>
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>He Thong Agent</title>
+<link rel="stylesheet" href="./styles.css" />
+<style>
+/* Critical inline — dashboard visible ngay cả khi styles.css chưa load */
+:root { --bg: #f7f5ef; --panel: #ffffff; --text: #1e2528; --muted: #69727a; --line: #ddd8cd; --primary: #176b63; --accent: #c7512f; }
+html, body { margin:0; padding:0; min-height:100vh; background:#f7f5ef; color:#1e2528; font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif; }
+#__bootstrap { display:flex; align-items:center; justify-content:center; height:100vh; flex-direction:column; gap:12px; background:#f7f5ef; }
+#__bootstrap .dot { width:36px; height:36px; border:3px solid #ddd8cd; border-top-color:#176b63; border-radius:50%; animation:__spin .7s linear infinite; }
+#__bootstrap p { color:#69727a; font-size:14px; margin:0; }
+@keyframes __spin { to { transform:rotate(360deg); } }
+/* Tabs visible before JS runs */
+.tab-content { display:none; }
+.tab-content.active { display:block; }
+/* Make app-shell visible immediately */
+.app-shell { padding:18px; }
+.topbar { display:flex; align-items:center; justify-content:space-between; padding:14px 16px; border:1px solid #ddd8cd; border-radius:8px; background:#fff; margin-bottom:12px; }
+.tab-bar { display:flex; gap:0; border-bottom:1px solid #ddd8cd; background:#fff; padding:0 16px; overflow-x:auto; margin-bottom:16px; }
+.tab-bar .tab { padding:10px 16px; border:none; background:none; cursor:pointer; font-size:13px; font-weight:600; color:#69727a; border-bottom:2px solid transparent; white-space:nowrap; }
+.tab-bar .tab.active { color:#176b63; border-bottom-color:#176b63; }
+.dashboard-metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+.metric-card { border:1px solid #ddd8cd; border-radius:8px; padding:11px 12px; background:#fbfaf6; }
+.metric-label { color:#69727a; font-size:11px; font-weight:800; text-transform:uppercase; }
+.metric-value { font-size:20px; font-weight:900; margin-top:6px; }
+.dag-board { display:grid; grid-template-columns:repeat(6,minmax(160px,1fr)); gap:10px; }
+.dag-column { border:1px solid #ddd8cd; border-radius:8px; padding:10px; background:#fbfaf6; }
+.dag-node { border:1px solid #ddd8cd; border-radius:8px; padding:8px; background:#fff; margin-bottom:6px; }
+.dag-node-title { display:flex; align-items:center; gap:7px; font-size:12px; font-weight:900; }
+.status-dot { width:9px; height:9px; border-radius:50%; background:#ddd8cd; display:inline-block; }
+.run-state { display:inline-block; border-radius:20px; padding:5px 9px; font-size:12px; font-weight:800; }
+.run-state.ready { color:#176b63; background:#e5f4f0; }
+.muted { color:#69727a; }
+</style>
+</head>
+<body>
+<div id="__bootstrap"><div class="dot"></div><p>Đang khởi động hệ thống…</p></div>
+<div class="app-shell">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">A</div>
+      <div>
+        <h1>Hệ Thống Agent</h1>
+        <p id="workspaceLabel">Chưa mở thư mục</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button id="chooseFolderBtn" class="primary-button" type="button">Mở thư mục</button>
+      <select id="sessionSelect" aria-label="Phiên làm việc"></select>
+      <button id="newSessionBtn" class="ghost-button" type="button">Phiên mới</button>
+      <button id="settingsToggleBtn" class="ghost-button" type="button">⚙</button>
+      <button id="refreshObservabilityBtn" class="ghost-button" type="button" title="Refresh">⟳</button>
+    </div>
+  </header>
+
+  <nav class="tab-bar">
+    <button class="tab active" data-tab="overview">Tổng quan</button>
+    <button class="tab" data-tab="flow">Luồng Agent</button>
+    <button class="tab" data-tab="analysis">Phân tích</button>
+    <button class="tab" data-tab="plan">Kế hoạch</button>
+    <button class="tab" data-tab="execution">Thực thi <span class="badge" id="execBadge" style="display:none">0</span></button>
+    <button class="tab" data-tab="review">Review <span class="badge" id="reviewBadge" style="display:none">0</span></button>
+    <button class="tab" data-tab="changes">Thay đổi <span class="badge" id="changesBadge" style="display:none">0</span></button>
+    <button class="tab" data-tab="log">Nhật ký</button>
+    <button class="tab" data-tab="doctor">Doctor <span class="badge" id="doctorBadge" style="display:none">0</span></button>
+  </nav>
+
+  <main class="dashboard-main">
+    <!-- Tab: Tổng quan -->
+    <section class="tab-content active" id="tab-overview">
+      <div class="overview-grid">
+        <div class="ov-card"><h3>Trạng thái</h3><div id="ovStatus"><span class="run-state ready">Sẵn sàng</span></div></div>
+        <div class="ov-card"><h3>Yêu cầu</h3><div id="ovTask"><p class="muted">Chưa có tác vụ</p></div></div>
+        <div class="ov-card"><h3>Kết quả gần nhất</h3><div id="ovResult"></div></div>
+        <div class="ov-card"><h3>Thống kê</h3><div id="ovStats"><p class="muted">0 files | 0 evidence | 0 impacts</p></div></div>
+        <div class="ov-card">
+          <h3>Autonomy L4/L5</h3>
+          <div class="autonomy-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <span id="autonomyStatus" class="autonomy-status" style="color:#69727a;font-size:13px">Chưa có báo cáo</span>
+            <button id="autonomyScanBtn" class="ghost-button small-button" type="button">Quét idle</button>
           </div>
+          <div id="autonomySummary"></div>
         </div>
-
-        <div class="top-actions">
-          <button id="chooseFolderBtn" class="primary-button" type="button">Mở thư mục</button>
-          <select id="sessionSelect" aria-label="Phiên làm việc"></select>
-          <button id="newSessionBtn" class="ghost-button" type="button">Phiên mới</button>
-        </div>
-      </header>
-
-      <section class="settings-bar" aria-label="Cấu hình model">
-        <label>
-          <span>Server</span>
-          <input id="serverInput" type="url" spellcheck="false" />
-        </label>
-        <label>
-          <span>Model</span>
-          <input id="modelInput" type="text" spellcheck="false" />
-        </label>
-        <label>
-          <span>API key</span>
-          <input id="apiKeyInput" type="password" spellcheck="false" autocomplete="off" />
-        </label>
-        <label class="toggle-field">
-          <input id="autoConfirmInput" type="checkbox" />
-          <span>Auto xác nhận</span>
-        </label>
-        <label class="toggle-field">
-          <input id="directWorkspaceInput" type="checkbox" />
-          <span>Làm trực tiếp</span>
-        </label>
-        <button id="saveSettingsBtn" class="ghost-button" type="button">Lưu</button>
-        <div id="saveStatus" class="save-status"></div>
-      </section>
-
-      <main class="workspace dashboard-workspace">
-        <section class="dashboard-panel" aria-label="Bảng điều khiển tác tử">
-          <div class="dashboard-header">
-            <div>
-              <p class="eyebrow">Web Dashboard</p>
-              <h2>Trạng thái nút xử lý</h2>
-            </div>
-            <div id="runState" class="run-state">Sẵn sàng</div>
-          </div>
-
-          <form id="composer" class="task-composer" aria-label="Khởi chạy tác vụ">
-            <textarea
-              id="messageInput"
-              rows="2"
-              placeholder="Mô tả tác vụ cần chạy trong workspace đang mở"
-            ></textarea>
+        <div class="ov-card ov-timeline">
+          <h3>Pipeline</h3>
+          <div class="task-composer">
+            <textarea id="messageInput" rows="2" placeholder="Mô tả tác vụ cần chạy..."></textarea>
             <button id="sendBtn" class="send-button" type="submit">Chạy</button>
-          </form>
-
+          </div>
           <div id="dashboardMetrics" class="dashboard-metrics"></div>
           <div id="dagBoard" class="dag-board"></div>
+        </div>
+      </div>
+    </section>
 
-          <div class="dashboard-grid">
-            <section class="summary-card">
-              <h3>Kết quả gần nhất</h3>
-              <div id="runSummary" class="run-summary"></div>
-            </section>
-            <section class="summary-card">
-              <h3>Tệp & blocker</h3>
-              <div id="artifactList" class="artifact-list"></div>
-            </section>
-            <section class="summary-card autonomy-card">
-              <div class="autonomy-header">
-                <div>
-                  <p class="eyebrow">Autonomy L4/L5</p>
-                  <h3>Memory, debt discovery & skill proposals</h3>
-                </div>
-                <button id="autonomyScanBtn" class="ghost-button small-button" type="button">Quét idle</button>
-              </div>
-              <div id="autonomyStatus" class="autonomy-status">Chưa có dữ liệu autonomy.</div>
-              <div id="autonomySummary" class="autonomy-summary"></div>
-            </section>
-          </div>
-        </section>
-
-        <aside class="run-panel">
-          <div class="run-panel-header">
-            <h2>Nhật ký giám sát</h2>
-            <button id="refreshObservabilityBtn" class="ghost-button small-button" type="button">Làm mới</button>
-          </div>
-          <div id="progressList" class="progress-list"></div>
-          <div class="system-log-header">Backend events</div>
-          <div id="systemLogList" class="system-log-list"></div>
+    <!-- Tab: Luồng Agent -->
+    <section class="tab-content" id="tab-flow">
+      <div class="flow-layout">
+        <div id="flowCanvas" class="flow-canvas">
+          <p class="muted" style="padding:24px">Đang tải topology…</p>
+        </div>
+        <aside id="flowDetail" class="flow-detail">
+          <p class="muted">Click một node trong sơ đồ để xem chi tiết.</p>
         </aside>
-      </main>
-    </div>
+      </div>
+      <div id="flowIOPanel" class="flow-io-panel">
+        <p class="muted" style="padding:24px;text-align:center">
+          Chạy một task ở tab "Tổng quan" để xem input → output ở đây.
+        </p>
+      </div>
+      <details class="flow-fallback" style="margin-top:16px">
+        <summary style="cursor:pointer;color:#69727a;font-size:12px">Hiển thị dạng cột (fallback)</summary>
+        <div id="dagBoardFull" class="dag-board-full" style="margin-top:8px"></div>
+        <div id="nodeDetail" class="node-detail-panel"><p class="muted">Click một node để xem chi tiết</p></div>
+      </details>
+    </section>
 
-    <script src="./app.js"></script>
-  </body>
+    <!-- Tab: Phân tích -->
+    <section class="tab-content" id="tab-analysis">
+      <div class="analysis-grid">
+        <div class="an-card"><h4>Request Understanding</h4><div id="anRequest"><p class="muted">Chưa phân tích</p></div></div>
+        <div class="an-card"><h4>CodeGraph / Evidence</h4><div id="anEvidence"><p class="muted">Chưa có evidence</p></div></div>
+        <div class="an-card"><h4>Impact Map</h4><div id="anImpact"><p class="muted">Chưa có impact analysis</p></div></div>
+        <div class="an-card"><h4>Risks & Unknowns</h4><div id="anRisks"><p class="muted">Chưa có</p></div></div>
+      </div>
+    </section>
+
+    <!-- Tab: Kế hoạch -->
+    <section class="tab-content" id="tab-plan">
+      <div id="planItems"><p class="muted">Chưa có kế hoạch</p></div>
+      <div id="planHistory"></div>
+    </section>
+
+    <!-- Tab: Thực thi -->
+    <section class="tab-content" id="tab-execution">
+      <div class="exec-header">
+        <strong id="execProgress">Chưa chạy</strong>
+        <span id="execCurrent"></span>
+      </div>
+      <div id="execStream" class="exec-stream"><span class="muted">Đang chờ tác vụ...</span></div>
+      <div class="exec-tools" id="execToolCalls"></div>
+      <div class="exec-tests" id="execTests"></div>
+    </section>
+
+    <!-- Tab: Review -->
+    <section class="tab-content" id="tab-review">
+      <div class="review-subtabs">
+        <button class="subtab active" data-subtab="code">Code Review</button>
+        <button class="subtab" data-subtab="security">Security Review</button>
+        <button class="subtab" data-subtab="release">Release Gate</button>
+      </div>
+      <div class="review-content" id="reviewContent"><p class="muted">Chưa có review</p></div>
+    </section>
+
+    <!-- Tab: Thay đổi -->
+    <section class="tab-content" id="tab-changes">
+      <div class="changes-layout">
+        <div class="changes-file-list" id="changesFileList"><p class="muted">Chưa có thay đổi</p></div>
+        <div class="changes-diff-viewer" id="changesDiffViewer"><p class="muted">Chọn file để xem diff</p></div>
+      </div>
+    </section>
+
+    <!-- Tab: Doctor -->
+    <section class="tab-content" id="tab-doctor">
+      <div class="doctor-controls">
+        <button id="doctorRunBtn" class="primary-button" type="button">Chạy chẩn đoán</button>
+        <span id="doctorStatus" class="muted">Chưa chạy</span>
+      </div>
+      <div class="doctor-layout">
+        <div class="doctor-events" id="doctorEvents"><p class="muted">Sự kiện sẽ hiện ở đây khi Doctor chạy.</p></div>
+        <div class="doctor-stream">
+          <h4>Patch đang viết</h4>
+          <pre id="doctorPatchStream" class="doctor-typewriter"><span class="muted">— chờ stream —</span></pre>
+        </div>
+      </div>
+      <div id="doctorSummary" class="doctor-summary"></div>
+    </section>
+
+    <!-- Tab: Nhật ký -->
+    <section class="tab-content" id="tab-log">
+      <div class="log-controls">
+        <select id="logFilterNode"><option value="">Tất cả node</option></select>
+        <select id="logFilterType"><option value="">Tất cả loại</option></select>
+        <label><input type="checkbox" id="logToggleDebug"> Debug JSON</label>
+      </div>
+      <div id="logList" class="log-virtual-list"><p class="muted">Chưa có sự kiện</p></div>
+    </section>
+  </main>
+
+  <!-- Settings Drawer -->
+  <div class="settings-drawer-overlay" id="settingsDrawerOverlay"></div>
+  <aside class="settings-drawer" id="settingsDrawer">
+    <h2>Cài đặt</h2>
+    <label><span>Server</span><input id="serverInput" type="url" spellcheck="false" /></label>
+    <label><span>Default model</span><input id="modelInput" type="text" spellcheck="false" /></label>
+    <label><span>API key</span><input id="apiKeyInput" type="password" spellcheck="false" autocomplete="off" /></label>
+    <label><span>Planner model</span><input id="plannerModelInput" type="text" spellcheck="false" placeholder="(default)" /></label>
+    <label><span>Coder model</span><input id="coderModelInput" type="text" spellcheck="false" placeholder="(default)" /></label>
+    <label><span>Reviewer model</span><input id="reviewerModelInput" type="text" spellcheck="false" placeholder="(default)" /></label>
+    <label class="toggle-field"><input id="autoConfirmInput" type="checkbox" /><span>Auto xác nhận</span></label>
+    <label class="toggle-field"><input id="directWorkspaceInput" type="checkbox" /><span>Làm trực tiếp</span></label>
+    <label class="toggle-field"><input id="bypassPolicyInput" type="checkbox" /><span>Bypass policy</span></label>
+    <button id="saveSettingsBtn" class="primary-button" type="button">Lưu</button>
+    <div id="saveStatus" class="save-status"></div>
+  </aside>
+</div>
+
+<div id="startupError" style="display:none;padding:40px;font-family:sans-serif;background:#fef2f2;color:#991b1b;position:fixed;inset:0;z-index:9999;overflow:auto;">
+  <h2>Không khởi động được</h2>
+  <p id="startupErrorMessage"></p>
+  <pre id="startupErrorStack" style="font-size:11px;color:#69727a;white-space:pre-wrap;"></pre>
+  <button onclick="location.reload()" style="margin-top:16px;padding:8px 20px;cursor:pointer">Thử lại</button>
+</div>
+
+<script src="./flowView.js"></script>
+<script src="./app.js"></script>
+</body>
 </html>

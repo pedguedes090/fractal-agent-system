@@ -1,10 +1,23 @@
 const path = require("path");
 const crypto = require("crypto");
 const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+
+// On Windows the default shader cache lives under %LOCALAPPDATA%\<app>\GPUCache
+// and Chromium sometimes can't move it on first launch ("Unable to move the cache:
+// Access is denied"). Forcing in-process-gpu / disable-gpu-sandbox was used to
+// silence those errors, but on Windows 11 with hardware acceleration that combo
+// makes the GPU process crash *after* the renderer paints — the JS runs, the DOM
+// is built, and then the window stays black because the framebuffer is never
+// presented. Set AGENT_DISABLE_HW_ACCEL=1 if you need to opt out instead.
+if (process.env.AGENT_DISABLE_HW_ACCEL === "1") {
+  app.disableHardwareAcceleration();
+}
+
 const { AppDatabase } = require("./appDatabase");
 const { AgentBackendService } = require("./backendService");
 const { SettingsStore } = require("./settingsStore");
 const { SessionStore } = require("./sessionStore");
+const { getWorkspaceDiff } = require("./workspaceDiff");
 
 let mainWindow;
 let appDatabase;
@@ -46,15 +59,56 @@ function createWindow() {
     minHeight: 620,
     title: "He Thong Agent",
     backgroundColor: "#f7f5ef",
+    show: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: false  // must be false for preload to use Node require()
     }
   });
 
-  mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
+  // Fallback: force-show window after 2s even if ready-to-show hasn't fired
+  const forceShowTimer = setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      console.warn("[main] Force-showing window after timeout");
+      mainWindow.show();
+      mainWindow.webContents.openDevTools({ mode: "bottom" });
+    }
+  }, 2000);
+
+  mainWindow.once("ready-to-show", () => {
+    clearTimeout(forceShowTimer);
+    mainWindow.show();
+  });
+
+  // Capture renderer console errors
+  mainWindow.webContents.on("console-message", (_event, _level, message, _line, _sourceId) => {
+    const prefix = _level >= 3 ? "[ERROR]" : _level >= 2 ? "[WARN]" : "[LOG]";
+    console.log(`[renderer] ${prefix} ${message}`);
+  });
+
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    console.error("[renderer] did-fail-load:", errorCode, errorDescription, validatedURL);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.loadURL(`data:text/html,<html><body style="background:#fef2f2;padding:40px;font-family:sans-serif"><h2>Load failed</h2><p>${errorDescription} (${errorCode})</p><p>URL: ${validatedURL}</p></body></html>`);
+    }
+  });
+
+  mainWindow.webContents.on("preload-error", (_event, _preloadPath, error) => {
+    console.error("[preload-error]", error);
+  });
+
+  // Open DevTools in dev mode to catch errors
+  if (process.env.AGENT_DEVTOOLS === "1") {
+    mainWindow.webContents.openDevTools({ mode: "bottom" });
+  }
+
+  const indexPath = path.join(__dirname, "../renderer/index.html");
+  console.log("[main] Loading:", indexPath, "exists:", require("fs").existsSync(indexPath));
+  mainWindow.loadFile(indexPath).catch((err) => {
+    console.error("[main] loadFile failed:", err.message);
+  });
 }
 
 function getInitialState() {
@@ -107,6 +161,18 @@ function registerIpc() {
     };
   });
 
+  ipcMain.handle("workspace:diff", async (_event, sessionId, relativePath, status) => {
+    const session = sessionStore.get(sessionId);
+    if (!session?.workspacePath) throw new Error("Phiên không có workspace hợp lệ.");
+    const latestRun = Array.isArray(session.runs) ? session.runs[session.runs.length - 1] : null;
+    const allowedPaths = new Set((latestRun?.changedFiles || []).map((file) =>
+      String(typeof file === "string" ? file : (file?.path || "")).replace(/\\/g, "/")
+    ));
+    const requestedPath = String(relativePath || "").replace(/\\/g, "/");
+    if (!allowedPaths.has(requestedPath)) throw new Error("File không thuộc thay đổi của run gần nhất.");
+    return getWorkspaceDiff(session.workspacePath, requestedPath, status);
+  });
+
   ipcMain.handle("sessions:delete", (_event, sessionId) => {
     return sessionStore.delete(sessionId);
   });
@@ -121,6 +187,42 @@ function registerIpc() {
 
   ipcMain.handle("agent:autonomy-scan", async (_event, payload) => {
     return backendService.runAutonomyScan({ workspacePath: payload?.workspacePath || "" });
+  });
+
+  ipcMain.handle("agent:topology", async () => {
+    return backendService.getTopology();
+  });
+
+  ipcMain.handle("agent:cancel", async (_event, executionId) => {
+    return backendService.cancelRun(executionId);
+  });
+
+  ipcMain.handle("doctor:run", async (event, payload) => {
+    const settings = settingsStore.get();
+    const session = payload?.sessionId ? sessionStore.get(payload.sessionId) : null;
+    const workspacePath = payload?.workspacePath || session?.workspacePath || "";
+    if (!workspacePath) throw new Error("workspacePath is required");
+    const emitEvent = (message) => {
+      try {
+        event.sender.send("doctor:event", message);
+      } catch {
+        /* renderer may be gone; ignore */
+      }
+    };
+    try {
+      const result = await backendService.runDoctor({
+        workspacePath,
+        sessionId: session?.id || null,
+        apiKey: settings.apiKey || "",
+        model: settings.model || "",
+        emitEvent
+      });
+      emitEvent({ type: "doctor.complete", ok: !!result?.ok, result });
+      return { ok: !!result?.ok, result };
+    } catch (error) {
+      emitEvent({ type: "doctor.error", error: error.message });
+      throw error;
+    }
   });
 
   ipcMain.handle("agent:send", async (event, payload) => {

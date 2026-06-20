@@ -131,7 +131,7 @@ class WorkspacePolicyTests(unittest.TestCase):
 
         self.assertEqual(results[-1]["code"], 0)
         self.assertTrue(results[-1]["directWorkspace"])
-        self.assertEqual(Path(run.call_args.kwargs["cwd"]), project)
+        self.assertEqual(str(Path(run.call_args.kwargs["cwd"]).resolve()), str(project.resolve()))
 
     def test_setup_commands_reject_shell_metacharacters(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -11,3 +11,8 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+
+# codebase-memory-mcp binary is auto-downloaded per-platform on first boot.
+# See engine/agent_engine/codebase_memory.py:ensure_local_binary().
+.tools/
+.env
