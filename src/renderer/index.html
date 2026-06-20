@@ -48,6 +48,7 @@ html, body { margin:0; padding:0; min-height:100vh; background:#f7f5ef; color:#1
       </div>
     </div>
     <div class="top-actions">
+      <span id="fullPowerHeaderBadge" class="fp-header-badge" style="display:none"></span>
       <button id="chooseFolderBtn" class="primary-button" type="button">Mở thư mục</button>
       <select id="sessionSelect" aria-label="Phiên làm việc"></select>
       <button id="newSessionBtn" class="ghost-button" type="button">Phiên mới</button>
@@ -83,6 +84,14 @@ html, body { margin:0; padding:0; min-height:100vh; background:#f7f5ef; color:#1
             <button id="autonomyScanBtn" class="ghost-button small-button" type="button">Quét idle</button>
           </div>
           <div id="autonomySummary"></div>
+        </div>
+        <div class="ov-card">
+          <h3>🤖 Auto Loop</h3>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap">
+            <span id="autoLoopStatus" style="color:#69727a;font-size:13px">Tắt — bật để hệ thống tự chọn finding/ý tưởng và chạy liên tục.</span>
+            <button id="autoLoopToggleBtn" class="ghost-button small-button" type="button">Bật Auto Loop</button>
+          </div>
+          <div id="autoLoopLog" style="font-size:11.5px;color:#94a3b8;max-height:160px;overflow:auto;border-top:1px solid var(--line);padding-top:6px"></div>
         </div>
         <div class="ov-card ov-timeline">
           <h3>Pipeline</h3>
@@ -200,9 +209,34 @@ html, body { margin:0; padding:0; min-height:100vh; background:#f7f5ef; color:#1
     <label><span>Planner model</span><input id="plannerModelInput" type="text" spellcheck="false" placeholder="(default)" /></label>
     <label><span>Coder model</span><input id="coderModelInput" type="text" spellcheck="false" placeholder="(default)" /></label>
     <label><span>Reviewer model</span><input id="reviewerModelInput" type="text" spellcheck="false" placeholder="(default)" /></label>
+    <label><span>Giao diện</span>
+      <select id="themeSelect">
+        <option value="auto">Tự động (theo hệ thống)</option>
+        <option value="light">Sáng</option>
+        <option value="dark">Tối</option>
+      </select>
+    </label>
     <label class="toggle-field"><input id="autoConfirmInput" type="checkbox" /><span>Auto xác nhận</span></label>
     <label class="toggle-field"><input id="directWorkspaceInput" type="checkbox" /><span>Làm trực tiếp</span></label>
     <label class="toggle-field"><input id="bypassPolicyInput" type="checkbox" /><span>Bypass policy</span></label>
+
+    <div id="fullPowerPanel" class="full-power-panel">
+      <h3>⚠ Full Power Mode</h3>
+      <p class="full-power-warning">
+        Các cờ dưới đây cho phép agent chạy <strong>mọi lệnh shell</strong>,
+        chỉnh hệ thống, và (với UAC) truy cập toàn bộ Windows.
+        Chỉ bật khi bạn hiểu rõ rủi ro — một task LLM sinh sai có thể xoá file,
+        đổi registry, gỡ phần mềm, hoặc làm hỏng Windows.
+      </p>
+      <label class="toggle-field"><input id="fpBypassSafeInput" type="checkbox" />
+        <span>Bypass command allowlist (<code>AGENT_BYPASS_SAFE_COMMANDS=1</code>)</span></label>
+      <label class="toggle-field"><input id="fpRequireAdminInput" type="checkbox" />
+        <span>Require Administrator (UAC elevate on next launch)</span></label>
+      <label class="toggle-field"><input id="fpAutoLoopAllowAdminInput" type="checkbox" />
+        <span>Allow Auto Loop while elevated (extra consent)</span></label>
+      <div id="fpStatusBadge" class="fp-status-badge"></div>
+    </div>
+
     <button id="saveSettingsBtn" class="primary-button" type="button">Lưu</button>
     <div id="saveStatus" class="save-status"></div>
   </aside>

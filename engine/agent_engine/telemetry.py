@@ -11,6 +11,7 @@ from typing import Any, Iterator
 
 _correlation_id: ContextVar[str] = ContextVar("correlation_id", default="")
 _token_usage_total: ContextVar[int] = ContextVar("token_usage_total", default=0)
+_token_usage_baseline: ContextVar[int] = ContextVar("token_usage_baseline", default=0)
 _configured = False
 
 try:
@@ -145,10 +146,25 @@ def get_correlation_id() -> str:
 
 def reset_token_usage() -> None:
     _token_usage_total.set(0)
+    _token_usage_baseline.set(0)
 
 
 def get_token_usage() -> int:
     return _token_usage_total.get()
+
+
+def get_token_usage_delta() -> dict[str, int]:
+    """Snapshot the per-node token delta. Stores baseline on the contextvar so
+    the next call returns tokens recorded since this call. Safe to invoke from
+    any node lifecycle hook; returns {} if no usage recorded since last reset.
+    """
+    total = _token_usage_total.get()
+    baseline = _token_usage_baseline.get()
+    delta = max(0, int(total) - int(baseline))
+    _token_usage_baseline.set(int(total))
+    if delta <= 0:
+        return {}
+    return {"total": delta}
 
 
 def inject_trace_context(carrier: dict[str, str]) -> dict[str, str]:

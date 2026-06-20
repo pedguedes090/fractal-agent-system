@@ -73,11 +73,16 @@ class FlowView {
 
   setEventHistory(events) {
     this.statusMap.clear(); this.lastEventFor.clear();
+    this.eventHistoryByNode = new Map();
+    this.allEvents = [];
+    this.nodeStartedAt = new Map();
+    this.nodeCompletedAt = new Map();
     this._startedAt = null;
     if (this._elapsedTimer) { clearInterval(this._elapsedTimer); this._elapsedTimer = null; }
     for (const ev of events || []) this._applyProgress(ev, false);
     if (this.svg) this._refreshNodes();
     this._updateStatusBanner(null, null);
+    this._renderInactivePanel();
   }
 
   reset() {
@@ -85,7 +90,7 @@ class FlowView {
     this._sticky = false; this.selectedId = null;
     if (this.svg) this._refreshNodes();
     this._clearHighlight();
-    if (this.detail) this.detail.innerHTML = `<p class="muted">Click một node để xem chi tiết.</p>`;
+    this._renderInactivePanel();
   }
 
   onProgress(progress) {
@@ -97,19 +102,46 @@ class FlowView {
     if (!progress) return;
     const stage = String(progress.stage || "");
     const node = String(progress.node || progress.stage || "");
-    if (!this.nodeIndex.has(node)) return;
+    // Always keep a global tail (for the Global Activity panel) even when
+    // the event is not tied to a known node.
+    if (!this.allEvents) this.allEvents = [];
+    this.allEvents.push(progress);
+    if (this.allEvents.length > 500) this.allEvents.shift();
+    if (!this.nodeIndex.has(node)) {
+      if (redraw && !this.selectedId) this._renderInactivePanel();
+      return;
+    }
+    // Per-node event history — append, cap 200.
+    if (!this.eventHistoryByNode) this.eventHistoryByNode = new Map();
+    const arr = this.eventHistoryByNode.get(node) || [];
+    arr.push(progress);
+    if (arr.length > 200) arr.shift();
+    this.eventHistoryByNode.set(node, arr);
     this.lastEventFor.set(node, progress);
+    // Resolve status from new eventType field when present, fall back to legacy stage regex.
+    const evType = String(progress.eventType || "");
     let status = this.statusMap.get(node);
-    if (stage === "error" || progress.error) status = "error";
-    else if (/_(start|begin)$/.test(stage) || stage === "node_start") status = "running";
-    else if (/_(end|complete|done)$/.test(stage) || stage === "node_end" || stage === "done") status = "done";
+    if (evType === "node_error" || stage === "error" || progress.error) status = "error";
+    else if (evType === "node_cancelled") status = "skipped";
+    else if (evType === "node_started" || /_(start|begin)$/.test(stage) || stage === "node_start") status = "running";
+    else if (evType === "node_completed" || /_(end|complete|done)$/.test(stage) || stage === "node_end" || stage === "done") status = "done";
     else if (stage === "skipped") status = "skipped";
     else if (!status) status = "running";
     this.statusMap.set(node, status);
+    // Track first-seen and completion timestamps for elapsed/bottleneck logic.
+    if (!this.nodeStartedAt) this.nodeStartedAt = new Map();
+    if (!this.nodeCompletedAt) this.nodeCompletedAt = new Map();
+    if (status === "running" && !this.nodeStartedAt.has(node)) {
+      this.nodeStartedAt.set(node, progress.at ? Date.parse(progress.at) : Date.now());
+    }
+    if (status === "done" || status === "error") {
+      this.nodeCompletedAt.set(node, progress.at ? Date.parse(progress.at) : Date.now());
+    }
     if (redraw) {
       this._refreshNode(node);
       if (status === "running") this._pulseEdgesInto(node);
       if (this.selectedId === node) this._renderDetail(node);
+      else if (!this.selectedId) this._renderInactivePanel();
     }
     this._updateStatusBanner(node, status);
   }
@@ -674,57 +706,351 @@ class FlowView {
     for (const els of this.nodeElements.values()) els.g.style.opacity = "1";
   }
 
-  // ── Detail panel (structured) ────────────────────────────────────────
+  // ── Topology adjacency (computed once after load) ────────────────────
+  _adjacency(id) {
+    if (!this._adjCache) {
+      this._adjCache = new Map();
+      for (const e of (this.topology?.edges || [])) {
+        if (!this._adjCache.has(e.from)) this._adjCache.set(e.from, { upstream: [], downstream: [] });
+        if (!this._adjCache.has(e.to))   this._adjCache.set(e.to,   { upstream: [], downstream: [] });
+        this._adjCache.get(e.from).downstream.push({ id: e.to,   kind: e.kind, label: e.label || "" });
+        this._adjCache.get(e.to  ).upstream.push(  { id: e.from, kind: e.kind, label: e.label || "" });
+      }
+    }
+    return this._adjCache.get(id) || { upstream: [], downstream: [] };
+  }
+
+  _roleOf(id) {
+    return this.topology?.roles?.[id] || ((this.lastEventFor.get(id) || {}).agentRole) || "agent";
+  }
+
+  _activityFor(id) {
+    return (this.eventHistoryByNode && this.eventHistoryByNode.get(id)) || [];
+  }
+
+  _nodeElapsedMs(id) {
+    const startedAt = (this.nodeStartedAt && this.nodeStartedAt.get(id));
+    if (!startedAt) return null;
+    const completedAt = (this.nodeCompletedAt && this.nodeCompletedAt.get(id));
+    return (completedAt || Date.now()) - startedAt;
+  }
+
+  _formatMs(ms) {
+    if (ms == null) return "—";
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+    const s = ms / 1000;
+    if (s < 60) return `${s.toFixed(1)}s`;
+    return `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s`;
+  }
+
+  _formatTime(at) {
+    if (!at) return "";
+    try { return String(at).slice(11, 19); } catch { return ""; }
+  }
+
+  // ── Inactive (no node selected) — Global Live Activity ─────────────────
+  _renderInactivePanel() {
+    if (!this.detail || this.selectedId) return;
+    const totals = this.nodeIndex.size;
+    const running = [];
+    let done = 0, errored = 0;
+    for (const [nid, s] of this.statusMap.entries()) {
+      if (s === "running") running.push(nid);
+      else if (s === "done") done++;
+      else if (s === "error") errored++;
+    }
+    const tail = (this.allEvents || []).slice(-10).reverse();
+    const bottleneck = this._computeBottleneck();
+    const health = errored ? "blocked" : (running.length ? "running" : (done >= totals && totals ? "healthy" : "idle"));
+    const healthLabel = { blocked: "BLOCKED", running: "RUNNING", healthy: "HEALTHY", idle: "IDLE" }[health];
+
+    let h = `<div class="flow-detail-header">
+      <span class="flow-detail-icon">📊</span>
+      <span class="flow-detail-title">Global Live Activity</span>
+      <span class="flow-pill flow-pill-${this._statusClass(health === "blocked" ? "error" : health === "healthy" ? "done" : (health === "running" ? "running" : "idle"))}" style="margin-left:auto">${healthLabel}</span>
+    </div>`;
+    h += `<div class="flow-detail-meta">
+      <span class="meta-chip">${done}/${totals} done</span>
+      <span class="meta-chip">${running.length} running</span>
+      ${errored ? `<span class="meta-chip" style="color:#fecaca">${errored} error</span>` : ""}
+    </div>`;
+
+    if (running.length) {
+      h += `<h4 class="flow-detail-h4">▶ Đang chạy</h4><ul class="chip-list">`;
+      for (const nid of running) {
+        const elapsed = this._formatMs(this._nodeElapsedMs(nid));
+        const role = this._roleOf(nid);
+        const icon = ROLE_ICONS[role] || "○";
+        h += `<li class="handoff-chip" data-target="${escapeHtml(nid)}">${escapeHtml(icon)} ${escapeHtml(nid)} · ${escapeHtml(elapsed)}</li>`;
+      }
+      h += `</ul>`;
+    } else {
+      h += `<p class="muted" style="margin-top:10px">Không có node nào đang chạy.</p>`;
+    }
+
+    if (bottleneck) {
+      h += `<h4 class="flow-detail-h4">⚠ Bottleneck</h4>
+            <div class="flow-detail-event">
+              <div class="event-row"><span class="event-stage">${escapeHtml(bottleneck.id)}</span><span class="event-time">${escapeHtml(this._formatMs(bottleneck.ms))}</span></div>
+              <div class="event-detail">${escapeHtml(bottleneck.reason)}</div>
+            </div>`;
+    }
+
+    h += `<h4 class="flow-detail-h4">📜 Hoạt động gần đây</h4>`;
+    if (tail.length) {
+      h += `<div class="flow-detail-event">`;
+      for (const ev of tail) {
+        const node = escapeHtml(ev.node || ev.stage || "-");
+        const stage = escapeHtml(String(ev.eventType || ev.stage || ""));
+        const detail = escapeHtml(String(ev.detail || "").slice(0, 140));
+        const time = escapeHtml(this._formatTime(ev.at));
+        h += `<div class="event-row"><span class="event-time">${time}</span><span class="event-stage">${node}</span><span class="meta-chip">${stage}</span></div>
+              <div class="event-detail">${detail}</div>`;
+      }
+      h += `</div>`;
+    } else {
+      h += `<p class="muted">Chưa có hoạt động nào.</p>`;
+    }
+
+    h += `<p class="muted" style="margin-top:14px;font-size:11px">Click một node trong sơ đồ để mở Agent Inspector.</p>`;
+    this.detail.innerHTML = h;
+    this._bindHandoffChips();
+  }
+
+  _computeBottleneck() {
+    let worst = null;
+    for (const [nid, s] of this.statusMap.entries()) {
+      if (s !== "running") continue;
+      const ms = this._nodeElapsedMs(nid);
+      if (ms == null) continue;
+      if (!worst || ms > worst.ms) worst = { id: nid, ms, reason: "Node đang chạy lâu nhất" };
+    }
+    if (worst) return worst;
+    // Retries
+    for (const [nid, evs] of (this.eventHistoryByNode || new Map()).entries()) {
+      const lastRetry = evs.reduce((m, e) => Math.max(m, Number(e.retryCount || 0)), 0);
+      if (lastRetry >= 2 && (!worst || lastRetry > (worst.retry || 0))) worst = { id: nid, ms: this._nodeElapsedMs(nid), retry: lastRetry, reason: `Đã retry ${lastRetry} lần` };
+    }
+    return worst;
+  }
+
+  _bindHandoffChips() {
+    if (!this.detail) return;
+    for (const el of this.detail.querySelectorAll("[data-target]")) {
+      el.style.cursor = "pointer";
+      el.addEventListener("click", () => {
+        const target = el.dataset.target;
+        if (target && this.nodeIndex.has(target)) this._selectNode(target);
+      });
+    }
+    // Subnav buttons
+    for (const el of this.detail.querySelectorAll("[data-subtab]")) {
+      el.addEventListener("click", () => {
+        this._activeSubtab = el.dataset.subtab;
+        if (this.selectedId) this._renderDetail(this.selectedId);
+      });
+    }
+  }
+
+  // ── Detail panel (Agent Inspector with subtabs) ──────────────────────
   _renderDetail(id) {
     if (!this.detail) return;
+    if (!id) { this._renderInactivePanel(); return; }
     const node = this.nodeIndex.get(id);
-    const ev = this.lastEventFor.get(id);
+    if (!node) { this._renderInactivePanel(); return; }
+    const events = this._activityFor(id);
+    const lastEv = this.lastEventFor.get(id);
     const status = this.statusMap.get(id) || "idle";
-    const role = this.topology.roles?.[id] || "agent";
+    const role = this._roleOf(id);
     const icon = ROLE_ICONS[role] || "○";
-    const palette = STATUS_COLORS[status] || STATUS_COLORS.idle;
-    const inputs = (this.topology.contextRoutes || {})[id] || [];
     const phase = node.phaseGroup || "";
+    const elapsed = this._nodeElapsedMs(id);
+    const retry = events.reduce((m, e) => Math.max(m, Number(e.retryCount || 0)), 0);
+    const cycle = events.reduce((m, e) => Math.max(m, Number(e.reviewCycle || 0)), 0);
+    const tab = this._activeSubtab || "overview";
 
     let h = `<div class="flow-detail-header">
       <span class="flow-detail-icon">${escapeHtml(icon)}</span>
       <span class="flow-detail-title">${escapeHtml(node.label)}</span>
       <span class="flow-pill flow-pill-${this._statusClass(status)}" style="margin-left:auto">${status.toUpperCase()}</span>
     </div>`;
-
-    // Meta row
     h += `<div class="flow-detail-meta">`;
     h += `<span class="meta-chip">${escapeHtml(id)}</span>`;
     if (phase) h += `<span class="meta-chip">${escapeHtml(phase)}</span>`;
     h += `<span class="meta-chip">${escapeHtml(role)}</span>`;
+    if (elapsed != null) h += `<span class="meta-chip">⏱ ${escapeHtml(this._formatMs(elapsed))}</span>`;
+    if (retry > 0) h += `<span class="meta-chip" style="color:#fde68a">↻ retry ${retry}</span>`;
+    if (cycle > 0) h += `<span class="meta-chip">cycle ${cycle}</span>`;
     h += `</div>`;
 
-    // Input state keys
-    if (inputs.length) {
-      h += `<h4 class="flow-detail-h4">↘ Input state keys</h4>`;
-      h += `<ul class="chip-list">${inputs.map(k => `<li>${escapeHtml(k)}</li>`).join("")}</ul>`;
+    // Subnav
+    const tabs = [
+      ["overview", "Overview"], ["activity", "Activity"], ["io", "I/O"],
+      ["messages", "Messages"], ["tools", "Tools"], ["health", "Health"], ["raw", "Raw"]
+    ];
+    h += `<div class="flow-subnav">`;
+    for (const [key, label] of tabs) {
+      const cls = key === tab ? "flow-subnav-btn active" : "flow-subnav-btn";
+      h += `<button class="${cls}" data-subtab="${key}">${label}</button>`;
     }
+    h += `</div>`;
 
-    // Live status
-    if (ev) {
-      const stage = escapeHtml(ev.stage || "-");
-      const detail = escapeHtml(String(ev.detail || ev.message || ev.error || "").slice(0, 300));
-      const at = ev.at ? escapeHtml(ev.at.slice(11, 19)) : "";
-      h += `<h4 class="flow-detail-h4">⚡ Sự kiện gần nhất</h4>`;
-      h += `<div class="flow-detail-event">
-        <div class="event-row"><span class="event-time">${at}</span><span class="event-stage">${stage}</span></div>
-        <div class="event-detail">${detail}</div>
-      </div>`;
-    } else {
-      h += `<p class="muted" style="margin-top:14px">Chưa có sự kiện cho node này.</p>`;
-    }
+    h += `<div class="flow-subbody">${this._renderSubtab(id, tab, { events, lastEv, status, role })}</div>`;
 
-    // Expandable raw
-    if (ev) {
-      h += `<details class="flow-detail-raw"><summary>Raw JSON</summary><pre>${escapeHtml(JSON.stringify(ev, null, 2))}</pre></details>`;
-    }
-
+    // Recent close-by-cluster errors (warnings/errors)
     this.detail.innerHTML = h;
+    this._bindHandoffChips();
+  }
+
+  _renderSubtab(id, tab, ctx) {
+    switch (tab) {
+      case "overview":  return this._subOverview(id, ctx);
+      case "activity":  return this._subActivity(id, ctx);
+      case "io":        return this._subIO(id, ctx);
+      case "messages":  return this._subMessages(id, ctx);
+      case "tools":     return this._subTools(id, ctx);
+      case "health":    return this._subHealth(id, ctx);
+      case "raw":       return this._subRaw(id, ctx);
+      default:          return this._subOverview(id, ctx);
+    }
+  }
+
+  _subOverview(id, { events, lastEv }) {
+    const adj = this._adjacency(id);
+    const inputs = (this.topology.contextRoutes || {})[id] || [];
+    let h = "";
+    if (lastEv) {
+      const stage = escapeHtml(lastEv.eventType || lastEv.stage || "-");
+      const detail = escapeHtml(String(lastEv.detail || "").slice(0, 300));
+      const time = escapeHtml(this._formatTime(lastEv.at));
+      h += `<h4 class="flow-detail-h4">⚡ Sự kiện gần nhất</h4>
+            <div class="flow-detail-event">
+              <div class="event-row"><span class="event-time">${time}</span><span class="event-stage">${stage}</span></div>
+              <div class="event-detail">${detail}</div>
+            </div>`;
+    } else {
+      h += `<p class="muted">Chưa có sự kiện cho node này.</p>`;
+    }
+    if (inputs.length) {
+      h += `<h4 class="flow-detail-h4">↘ Input state keys</h4>
+            <ul class="chip-list">${inputs.map(k => `<li>${escapeHtml(k)}</li>`).join("")}</ul>`;
+    }
+    if (adj.upstream.length) {
+      h += `<h4 class="flow-detail-h4">⬅ Upstream</h4><ul class="chip-list">`;
+      for (const u of adj.upstream) {
+        const lbl = u.label ? ` <span class="route-label">[${escapeHtml(u.label)}]</span>` : "";
+        h += `<li class="handoff-chip" data-target="${escapeHtml(u.id)}">${escapeHtml(u.id)}${lbl}</li>`;
+      }
+      h += `</ul>`;
+    }
+    if (adj.downstream.length) {
+      h += `<h4 class="flow-detail-h4">➡ Downstream</h4><ul class="chip-list">`;
+      for (const d of adj.downstream) {
+        const lbl = d.label ? ` <span class="route-label">[${escapeHtml(d.label)}]</span>` : "";
+        h += `<li class="handoff-chip" data-target="${escapeHtml(d.id)}">${escapeHtml(d.id)}${lbl}</li>`;
+      }
+      h += `</ul>`;
+    }
+    h += `<p class="muted" style="margin-top:8px;font-size:11px">${events.length} sự kiện đã ghi nhận cho node này.</p>`;
+    return h;
+  }
+
+  _subActivity(id, { events }) {
+    if (!events.length) return `<p class="muted">Chưa có sự kiện.</p>`;
+    let h = `<div class="flow-detail-event">`;
+    for (const ev of [...events].reverse()) {
+      const type = escapeHtml(ev.eventType || ev.stage || "—");
+      const detail = escapeHtml(String(ev.detail || "").slice(0, 240));
+      const time = escapeHtml(this._formatTime(ev.at));
+      const dur = ev.durationMs != null ? ` · ${escapeHtml(this._formatMs(ev.durationMs))}` : "";
+      h += `<div class="event-row"><span class="event-time">${time}</span><span class="event-stage event-pill event-pill-${escapeHtml((ev.eventType || ev.stage || "").replace(/[^a-z_]/gi, ""))}">${type}</span><span class="meta-chip">${escapeHtml(ev.status || "")}</span><span style="opacity:.7">${dur}</span></div>
+            <div class="event-detail">${detail}</div>`;
+    }
+    h += `</div>`;
+    return h;
+  }
+
+  _subIO(id, { events }) {
+    const started = events.find(e => e.eventType === "node_started");
+    const completed = [...events].reverse().find(e => e.eventType === "node_completed");
+    let h = "";
+    h += `<h4 class="flow-detail-h4">↘ Input</h4>`;
+    if (started && started.inputSummary) {
+      h += `<pre class="event-json">${escapeHtml(String(started.inputSummary))}</pre>`;
+    } else {
+      h += `<p class="muted">Chưa có input summary (cần sự kiện node_started).</p>`;
+    }
+    h += `<h4 class="flow-detail-h4">↗ Output</h4>`;
+    if (completed && completed.outputSummary) {
+      h += `<pre class="event-json">${escapeHtml(String(completed.outputSummary))}</pre>`;
+    } else {
+      h += `<p class="muted">Chưa có output summary (cần sự kiện node_completed).</p>`;
+    }
+    return h;
+  }
+
+  _subMessages(id, { events }) {
+    const calls = events.filter(e => e.eventType === "llm_call" || e.model);
+    if (!calls.length) return `<p class="muted">Chưa có LLM call nào được ghi nhận cho node này.</p>`;
+    let h = `<table class="kv-table"><thead><tr><th>Time</th><th>Model</th><th>Tokens</th><th>Detail</th></tr></thead><tbody>`;
+    for (const ev of calls) {
+      const time = escapeHtml(this._formatTime(ev.at));
+      const model = escapeHtml(ev.model || "");
+      const tu = ev.tokenUsage || {};
+      const tokens = typeof tu === "object" ? Object.entries(tu).map(([k,v]) => `${k}:${v}`).join(" ") : String(tu);
+      h += `<tr><td>${time}</td><td>${model}</td><td>${escapeHtml(tokens)}</td><td>${escapeHtml(String(ev.detail || "").slice(0, 160))}</td></tr>`;
+    }
+    h += `</tbody></table>`;
+    return h;
+  }
+
+  _subTools(id, { events }) {
+    const calls = events.filter(e => e.eventType === "tool_call" || e.tool);
+    if (!calls.length) return `<p class="muted">Chưa có tool call nào được ghi nhận cho node này.</p>`;
+    let h = `<table class="kv-table"><thead><tr><th>Time</th><th>Tool</th><th>Status</th><th>Duration</th><th>Detail</th></tr></thead><tbody>`;
+    for (const ev of calls) {
+      h += `<tr><td>${escapeHtml(this._formatTime(ev.at))}</td><td>${escapeHtml(ev.tool || "")}</td><td>${escapeHtml(ev.status || "")}</td><td>${escapeHtml(this._formatMs(ev.durationMs))}</td><td>${escapeHtml(String(ev.detail || "").slice(0, 160))}</td></tr>`;
+    }
+    h += `</tbody></table>`;
+    return h;
+  }
+
+  _subHealth(id, { events, status }) {
+    const errors = events.filter(e => e.eventType === "node_error" || e.status === "error" || e.error);
+    const warnings = events.filter(e => e.eventType === "warning" || (Array.isArray(e.warnings) && e.warnings.length));
+    let h = "";
+    h += `<h4 class="flow-detail-h4">Trạng thái</h4>
+          <div class="flow-detail-meta">
+            <span class="flow-pill flow-pill-${this._statusClass(status)}">${status.toUpperCase()}</span>
+            ${this._nodeElapsedMs(id) != null ? `<span class="meta-chip">⏱ ${escapeHtml(this._formatMs(this._nodeElapsedMs(id)))}</span>` : ""}
+          </div>`;
+    if (errors.length) {
+      h += `<h4 class="flow-detail-h4" style="color:#fecaca">✕ Lỗi (${errors.length})</h4>`;
+      for (const e of errors) {
+        h += `<div class="flow-detail-event" style="border-left:3px solid #ef4444;padding-left:8px">
+          <div class="event-detail">${escapeHtml(String(e.error || e.detail || "").slice(0, 400))}</div>
+        </div>`;
+      }
+    }
+    if (warnings.length) {
+      h += `<h4 class="flow-detail-h4" style="color:#fde68a">⚠ Cảnh báo (${warnings.length})</h4>`;
+      for (const w of warnings) {
+        const items = Array.isArray(w.warnings) && w.warnings.length ? w.warnings : [w.detail];
+        for (const item of items) h += `<div class="event-detail" style="border-left:3px solid #f59e0b;padding-left:8px">${escapeHtml(String(item || "").slice(0, 400))}</div>`;
+      }
+    }
+    if (!errors.length && !warnings.length) h += `<p class="muted">Không có lỗi/cảnh báo nào.</p>`;
+    return h;
+  }
+
+  _subRaw(id, { events }) {
+    if (!events.length) return `<p class="muted">Chưa có dữ liệu.</p>`;
+    let h = "";
+    for (const ev of [...events].reverse().slice(0, 50)) {
+      const label = escapeHtml(`${ev.eventType || ev.stage} · ${this._formatTime(ev.at)}`);
+      h += `<details class="flow-detail-raw"><summary>${label}</summary><pre>${escapeHtml(JSON.stringify(ev, null, 2))}</pre></details>`;
+    }
+    return h;
   }
 }
 

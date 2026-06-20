@@ -85,7 +85,7 @@ routes:
   human_gate:
     cases:
       - when: has_result
-        target: reporter_end
+        target: reporter
       - when: read_only
         target: read_only_reporter
     default: environment_gate
@@ -93,17 +93,17 @@ routes:
   environment_gate:
     cases:
       - when: has_result
-        target: reporter_end
+        target: reporter
     default: load_context_files
 
   reviewer_decision:
     cases:
       - when: has_result
-        target: reporter_end
+        target: reporter
       - when: worker_error
         target: reporter
       - when: blocked
-        target: reporter_end
+        target: reporter
       - when: replan_required
         target: plan_arbiter
       - when: changes_required
@@ -118,7 +118,7 @@ routes:
     cases:
       - when: auto_rework_granted
         target: openhands_worker
-    default: reporter_end
+    default: reporter
 
 contextRoutes:
   repo_intelligence:

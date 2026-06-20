@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import telemetry
-from .autonomy import autonomy_status, run_idle_discovery
+from .autonomy import autonomy_status, run_idle_discovery, select_next_task
 from .broker import SQLiteAgentBroker
 from .debug_log import write_debug_event
 from .deterministic_workflow import DEFAULT_WORKFLOW
@@ -245,6 +245,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/v1/autonomy/idle-scan":
             self._handle_autonomy_idle_scan()
             return
+        if self.path == "/v1/autonomy/next-task":
+            self._handle_autonomy_next_task()
+            return
         if self.path == "/v1/runs/cancel":
             try:
                 payload = self._read_json_body()
@@ -310,19 +313,48 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         write_line({"type": "ready", "executionId": execution_id_for_stream, "correlationId": correlation_id,
                     "sessionId": payload.get("sessionId")})
 
-        def emit(stage: str, detail: str) -> None:
+        import uuid as _emit_uuid
+        last_event_id_by_node: dict[str, str] = {}
+
+        def emit(stage: str, detail: str, **fields: Any) -> None:
             message = _progress(stage, detail)
             message["executionId"] = execution_id_for_stream
             message["sessionId"] = payload.get("sessionId")
+            message["correlationId"] = correlation_id
+            event_id = _emit_uuid.uuid4().hex
+            message["eventId"] = event_id
             # Stamp node field so the UI's log-filter-by-node, flowView status,
             # and execution-tab grouping work consistently.  When the stage
             # string IS a known node id (e.g. "openhands_worker"), that is
-            # the canonical node.  Sub-stages (e.g. "setup_commands") get the
-            # last-known-node injected by `build_graph` via `emit` closure.
-            node_name = _NODE_LANES.get(stage)
+            # the canonical node.  Sub-stages get the explicit `node=` kwarg
+            # from build_graph's traced_node wrapper.
+            node_name = fields.pop("node", None) or _NODE_LANES.get(stage)
             if node_name:
-                message["node"] = stage
-            write_debug_event("progress", {"stage": stage, "detail": detail})
+                message["node"] = node_name
+                message["parentEventId"] = last_event_id_by_node.get(node_name)
+                last_event_id_by_node[node_name] = event_id
+            # Default eventType for free-form sub-stage emits (lifecycle uses
+            # explicit `event_type=` from traced_node).
+            event_type = fields.pop("event_type", None)
+            if event_type:
+                message["eventType"] = event_type
+            # Allowlisted enrichment kwargs — copy non-None values through.
+            ALLOWED = (
+                "agent_role", "from_agent", "to_agent",
+                "duration_ms", "model", "tool", "status",
+                "input_summary", "output_summary",
+                "retry_count", "review_cycle",
+                "token_usage", "warnings", "error", "route_label",
+            )
+            for key in ALLOWED:
+                if key in fields and fields[key] is not None:
+                    # camelCase for the wire — matches existing UI convention.
+                    camel = "".join(
+                        part if i == 0 else part.title()
+                        for i, part in enumerate(key.split("_"))
+                    )
+                    message[camel] = fields[key]
+            write_debug_event("progress", {"stage": stage, "detail": detail, "node": node_name})
             write_line(message)
 
         server_kind = telemetry.SpanKind.SERVER if telemetry.SpanKind else None
@@ -428,6 +460,75 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": str(exc)})
         finally:
             _AUTONOMY_LOCK.release()
+
+    def _handle_autonomy_next_task(self) -> None:
+        """Pick the next autonomous task.
+
+        Body: {
+          workspacePath: str,
+          completedIds?: list[str],   # finding/idea ids already attempted this loop
+          ideaCursor?: int,           # rotation index into enhancement pool
+          rescanIfStale?: bool        # run idle-scan first if no report cached
+        }
+        Returns: { ok, task: {id,kind,category,title,task,source,priorityScore}|null,
+                   nextIdeaCursor, source: "cache"|"fresh_scan"|"none" }
+        """
+        try:
+            payload = self._read_json_body()
+        except Exception as exc:
+            self._send_json(400, {"error": f"invalid_json: {exc}"})
+            return
+        raw_workspace = str(payload.get("workspacePath") or "").strip()
+        if not raw_workspace:
+            self._send_json(400, {"error": "workspacePath is required"})
+            return
+        workspace_path = Path(raw_workspace).expanduser()
+        if not workspace_path.exists() or not workspace_path.is_dir():
+            self._send_json(400, {"error": "workspacePath must be an existing directory"})
+            return
+
+        completed_ids = set(map(str, payload.get("completedIds") or []))
+        idea_cursor = int(payload.get("ideaCursor") or 0)
+        rescan_if_stale = bool(payload.get("rescanIfStale"))
+
+        state_dir = _state_dir_path()
+        report = (autonomy_status(state_dir) or {}).get("lastReport")
+        source = "cache"
+        if (not report or rescan_if_stale) and not _AUTONOMY_LOCK.locked():
+            if _AUTONOMY_LOCK.acquire(blocking=False):
+                try:
+                    write_debug_event(
+                        "autonomy.next_task_rescan",
+                        {"workspacePath": str(workspace_path.resolve())},
+                    )
+                    report = run_idle_discovery(workspace_path, state_dir)
+                    source = "fresh_scan"
+                finally:
+                    _AUTONOMY_LOCK.release()
+
+        task = select_next_task(report, completed_ids, idea_cursor=idea_cursor)
+        next_cursor = idea_cursor
+        if task and task.get("kind") == "enhancement_idea":
+            next_cursor = (idea_cursor + 1) % 8  # pool size; small constant ok here.
+        write_debug_event(
+            "autonomy.next_task",
+            {
+                "selected": (task or {}).get("id"),
+                "kind": (task or {}).get("kind"),
+                "completedCount": len(completed_ids),
+            },
+        )
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "task": task,
+                "source": source if task else ("none" if not task else source),
+                "nextIdeaCursor": next_cursor,
+                "runLockActive": _WRITE_LOCK.locked(),
+                "autonomyScanActive": _AUTONOMY_LOCK.locked(),
+            },
+        )
 
     def _handle_doctor(self) -> None:
         """Stream scan→plan→patch→verify events as NDJSON.

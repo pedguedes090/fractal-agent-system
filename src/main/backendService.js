@@ -11,12 +11,16 @@ function parseJsonLine(line) {
 }
 
 class AgentBackendService {
-  constructor(userDataPath) {
+  constructor(userDataPath, options = {}) {
     this.userDataPath = userDataPath;
     this.child = null;
     this.endpoint = null;
     this.stderr = "";
     this.readyPromise = null;
+    // Optional getter so the backend env reflects the CURRENT settings each
+    // time it starts (without having to restart the whole app when the user
+    // flips a Full Power toggle, as long as the backend isn't already up).
+    this.getSettings = typeof options.getSettings === "function" ? options.getSettings : () => null;
   }
 
   start() {
@@ -25,13 +29,18 @@ class AgentBackendService {
     this.readyPromise = new Promise((resolve, reject) => {
       const projectRoot = getProjectRoot();
       const python = resolvePythonCommand(projectRoot);
+      const settings = (() => { try { return this.getSettings(); } catch { return null; } })();
       const child = spawn(
         python.command,
         [...python.args, "-m", "agent_engine.server", "--host", "127.0.0.1", "--port", "0"],
         {
           cwd: projectRoot,
           windowsHide: true,
-          env: buildPythonEnv({ projectRoot, userDataPath: this.userDataPath })
+          env: buildPythonEnv({
+            projectRoot,
+            userDataPath: this.userDataPath,
+            fullPower: settings?.fullPower
+          })
         }
       );
 
@@ -175,7 +184,7 @@ class AgentBackendService {
         const message = parseJsonLine(line);
         if (!message) continue;
         if (message.type === "progress" && typeof emitProgress === "function") {
-          emitProgress({
+          const forwarded = {
             stage: message.stage,
             detail: message.detail,
             at: message.at,
@@ -184,7 +193,23 @@ class AgentBackendService {
             sessionId: message.sessionId || sessionId,
             node: message.node || null,
             eventType: message.eventType || "progress"
-          });
+          };
+          // Enriched fields from the Python emit() — forward when present so the
+          // FlowView inspector + global panel can render them.
+          const ENRICHED = [
+            "eventId", "parentEventId",
+            "agentRole", "fromAgent", "toAgent",
+            "model", "tool", "status",
+            "durationMs", "retryCount", "reviewCycle",
+            "tokenUsage", "inputSummary", "outputSummary",
+            "warnings", "error", "routeLabel"
+          ];
+          for (const key of ENRICHED) {
+            if (message[key] !== undefined && message[key] !== null) {
+              forwarded[key] = message[key];
+            }
+          }
+          emitProgress(forwarded);
         }
         if (message.type === "result") result = message.result;
         if (message.type === "error") engineError = message.error;
@@ -326,6 +351,28 @@ class AgentBackendService {
     if (!response.ok) {
       const message = payload?.error || body.slice(0, 800) || "unknown";
       throw new Error(`Agent backend autonomy scan loi ${response.status}: ${message}`);
+    }
+    return payload;
+  }
+
+  async requestAutonomyNextTask({ workspacePath, completedIds, ideaCursor, rescanIfStale }) {
+    const endpoint = await this.start();
+    const response = await fetch(`${endpoint}/v1/autonomy/next-task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workspacePath,
+        completedIds: completedIds || [],
+        ideaCursor: ideaCursor || 0,
+        rescanIfStale: !!rescanIfStale,
+      }),
+    });
+    const body = await response.text().catch(() => "");
+    let payload = null;
+    try { payload = body ? JSON.parse(body) : null; } catch { payload = null; }
+    if (!response.ok) {
+      const message = payload?.error || body.slice(0, 800) || "unknown";
+      throw new Error(`Autonomy next-task loi ${response.status}: ${message}`);
     }
     return payload;
   }

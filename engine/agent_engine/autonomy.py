@@ -472,6 +472,184 @@ def run_idle_discovery(workspace: str | Path, state_dir: str | Path, *, limit: i
         memory.close()
 
 
+# ── Autonomous loop: pick a single task from the report ───────────────────
+
+# Priority order across categories. Critical/security blockers first, then
+# verification gaps, then maintainability, then debt cleanup, then enhancement
+# ideas from the rotating pool.
+_CATEGORY_ORDER = {
+    "security": 0,
+    "test_coverage": 1,
+    "maintainability": 2,
+    "technical_debt": 3,
+}
+
+# Rotating enhancement-idea pool. Used when there are no high-priority
+# findings left, so the loop never starves. Each idea is a small, scoped,
+# safe-by-default improvement the pipeline can attempt end-to-end.
+_ENHANCEMENT_IDEAS: list[dict[str, Any]] = [
+    {
+        "id": "idea-ui-keyboard-shortcuts",
+        "category": "enhancement_ui",
+        "title": "Bổ sung phím tắt cho FlowView",
+        "task": (
+            "Thêm phím tắt cho FlowView trong tab Luồng Agent: phím mũi tên để di chuyển node "
+            "được chọn theo upstream/downstream, phím Esc để bỏ chọn (về Global Live Activity), "
+            "phím số 1-7 để chuyển nhanh giữa các subtab Overview/Activity/I/O/Messages/Tools/Health/Raw. "
+            "Cập nhật hint hiển thị các phím trong panel."
+        ),
+    },
+    {
+        "id": "idea-ui-event-filter",
+        "category": "enhancement_ui",
+        "title": "Filter sự kiện theo eventType và status",
+        "task": (
+            "Thêm filter pills phía trên subtab Activity của Agent Inspector: cho phép lọc theo "
+            "eventType (node_started/node_completed/tool_call/llm_call/warning) và status. "
+            "Khi bật filter chỉ render các event matching, vẫn giữ cap 200/node."
+        ),
+    },
+    {
+        "id": "idea-perf-render-throttle",
+        "category": "enhancement_perf",
+        "title": "Throttle re-render Global panel",
+        "task": (
+            "Throttle _renderInactivePanel xuống ~250ms để tránh jank khi backend emit burst progress "
+            "events (>5 events/giây). Dùng requestAnimationFrame hoặc một guard timer; vẫn đảm bảo "
+            "lần render cuối phản ánh state mới nhất."
+        ),
+    },
+    {
+        "id": "idea-test-replay-roundtrip",
+        "category": "enhancement_tests",
+        "title": "Test replay round-trip cho event schema mới",
+        "task": (
+            "Viết test JS hoặc Python kiểm tra round-trip của progress event qua persistence: "
+            "tạo event với eventId/parentEventId/agentRole/durationMs/tokenUsage, qua "
+            "backendService normalization và sessionStore, replay lại flowView.setEventHistory "
+            "phải tái dựng đầy đủ các field."
+        ),
+    },
+    {
+        "id": "idea-obs-bottleneck-export",
+        "category": "enhancement_observability",
+        "title": "Export bottleneck report ra JSON",
+        "task": (
+            "Thêm nút Export ở Global Live Activity panel: xuất ra JSON danh sách top 5 node có "
+            "durationMs cao nhất trong session, kèm retryCount và tokenUsage. Lưu xuống "
+            ".agent-state/reports/bottleneck-<timestamp>.json."
+        ),
+    },
+    {
+        "id": "idea-ui-search-nodes",
+        "category": "enhancement_ui",
+        "title": "Ô search node trong FlowView",
+        "task": (
+            "Thêm input search nhỏ ở header FlowView; gõ vào sẽ highlight các node có id/label/role "
+            "matching và dim các node còn lại; Enter sẽ chọn node đầu tiên match."
+        ),
+    },
+    {
+        "id": "idea-doctor-history",
+        "category": "enhancement_doctor",
+        "title": "Lưu lịch sử Project Doctor scan",
+        "task": (
+            "Lưu mỗi lần Project Doctor scan vào .agent-state/doctor-history.jsonl, "
+            "thêm endpoint GET /v1/doctor/history trả về 20 lần scan gần nhất, hiển thị trong "
+            "dashboard tab Doctor (nếu chưa có thì render mới một panel nhỏ)."
+        ),
+    },
+    {
+        "id": "idea-flow-mini-timeline",
+        "category": "enhancement_ui",
+        "title": "Mini timeline ở dưới FlowView",
+        "task": (
+            "Thêm một mini timeline strip ở dưới flow canvas hiển thị các event lifecycle "
+            "(node_started/node_completed/node_error) theo trục thời gian; click một marker "
+            "để select node và mở subtab Activity tại event đó."
+        ),
+    },
+]
+
+
+def _format_finding_task(finding: dict[str, Any]) -> str:
+    title = finding.get("title", "")
+    source = finding.get("source", "")
+    evidence = (finding.get("evidence") or "").strip()
+    rec = (finding.get("recommendation") or "").strip()
+    cat = finding.get("category", "")
+    lines = [
+        f"Xử lý finding tự động phát hiện ({cat}): {title}",
+        f"Vị trí: {source}",
+    ]
+    if evidence:
+        lines.append(f"Bằng chứng: {evidence}")
+    if rec:
+        lines.append(f"Khuyến nghị: {rec}")
+    lines.append(
+        "Hãy đề xuất bản vá nhỏ nhất, có chủ đích, vẫn giữ tests pass; "
+        "nếu cần đổi public API hãy nói rõ tradeoff."
+    )
+    return "\n".join(lines)
+
+
+def select_next_task(
+    report: dict[str, Any] | None,
+    completed_ids: set[str] | None = None,
+    *,
+    idea_cursor: int = 0,
+) -> dict[str, Any] | None:
+    """Pick the single highest-priority task from an autonomy report.
+
+    Order:
+      1. Findings sorted by (_CATEGORY_ORDER, -priorityScore).
+      2. Rotating enhancement-idea pool (so the loop never starves).
+
+    Returns {id, category, title, task, source, priorityScore} or None
+    when the report is empty AND the idea pool is exhausted for this cursor.
+    """
+    completed_ids = completed_ids or set()
+    findings = list((report or {}).get("findings") or [])
+
+    def _sort_key(item: dict[str, Any]) -> tuple[int, float]:
+        cat = str(item.get("category") or "")
+        cat_rank = _CATEGORY_ORDER.get(cat, 10)
+        # higher priorityScore wins inside the same category → negate.
+        return (cat_rank, -float(item.get("priorityScore") or 0.0))
+
+    for finding in sorted(findings, key=_sort_key):
+        fid = str(finding.get("id") or "")
+        if not fid or fid in completed_ids:
+            continue
+        return {
+            "id": fid,
+            "kind": "finding",
+            "category": finding.get("category"),
+            "title": finding.get("title"),
+            "source": finding.get("source"),
+            "priorityScore": finding.get("priorityScore"),
+            "task": _format_finding_task(finding),
+        }
+
+    pool_size = len(_ENHANCEMENT_IDEAS)
+    if pool_size == 0:
+        return None
+    for offset in range(pool_size):
+        idea = _ENHANCEMENT_IDEAS[(idea_cursor + offset) % pool_size]
+        if idea["id"] in completed_ids:
+            continue
+        return {
+            "id": idea["id"],
+            "kind": "enhancement_idea",
+            "category": idea["category"],
+            "title": idea["title"],
+            "source": "autonomy.enhancement_pool",
+            "priorityScore": None,
+            "task": idea["task"],
+        }
+    return None
+
+
 def autonomy_status(state_dir: str | Path) -> dict[str, Any]:
     memory = ACTRMemoryStore(default_memory_path(state_dir))
     try:

@@ -1930,21 +1930,67 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         "reporter_end": "reporter",
     }
 
+    def _summarize_value(value: Any, limit: int = 400) -> str:
+        try:
+            if isinstance(value, (dict, list)):
+                rendered = json.dumps(value, ensure_ascii=False, default=str)
+            else:
+                rendered = str(value)
+        except Exception:
+            try:
+                rendered = repr(value)
+            except Exception:
+                rendered = "<unrepresentable>"
+        if len(rendered) > limit:
+            return rendered[:limit] + "…"
+        return rendered
+
+    def _summarize_state(state: dict[str, Any], keys: list[str], limit: int = 500) -> str:
+        slice_ = {k: state.get(k) for k in keys if k in state}
+        return _summarize_value(slice_, limit=limit)
+
+    context_routes = DEFAULT_WORKFLOW.context_routes
+
     def traced_node(node_name: str, fn: Callable[[PipelineState], dict[str, Any]]):
         def wrapped(state: PipelineState) -> dict[str, Any]:
             telemetry.set_correlation_id(state.get("correlationId"))
             execution_id = str(state.get("executionId", ""))
+            role = agent_roles.get(node_name, "agent")
+            retry_count = int(state.get("retryCount", 0) or 0)
+            review_cycle = int(state.get("reviewCycle", 0) or 0)
+            input_keys = list(context_routes.get(node_name, []) or [])
+            input_summary = _summarize_state(state, input_keys) if input_keys else ""
             if is_cancelled(execution_id):
-                emit(node_name, f"Pipeline cancelled before {node_name}")
+                emit(
+                    node_name,
+                    f"Pipeline cancelled before {node_name}",
+                    node=node_name,
+                    event_type="node_cancelled",
+                    agent_role=role,
+                    status="cancelled",
+                    retry_count=retry_count,
+                    review_cycle=review_cycle,
+                )
                 write_debug_event("pipeline.cancel.honored", {
                     "executionId": execution_id, "node": node_name,
                 })
                 raise CancelledExecution(f"Execution {execution_id} cancelled by user before {node_name}")
+            t0 = telemetry.now_ms() if hasattr(telemetry, "now_ms") else None
             # Emit node_start so flowView + exec tab can track lifecycle
-            emit(node_name, f"Node {node_name} bắt đầu")
+            emit(
+                node_name,
+                f"Node {node_name} bắt đầu",
+                node=node_name,
+                event_type="node_started",
+                agent_role=role,
+                status="running",
+                retry_count=retry_count,
+                review_cycle=review_cycle,
+                input_summary=input_summary or None,
+            )
             step_input = {
                 "node": node_name,
-                "role": agent_roles.get(node_name, "agent"),
+                "role": role,
                 "sessionId": state.get("sessionId", ""),
                 "executionId": execution_id,
                 "brokerRunId": state.get("brokerRunId", ""),
@@ -1954,17 +2000,51 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                     "agent.step",
                     {
                         "agent.step": node_name,
-                        "agent.role": agent_roles.get(node_name, "agent"),
+                        "agent.role": role,
                         "session.id": state.get("sessionId", ""),
                         "execution.id": state.get("executionId", ""),
                         "workspace.path": state.get("workspacePath", ""),
                         "broker.run_id": state.get("brokerRunId", ""),
                     },
                 ):
-                    output = fn(state)
+                    try:
+                        output = fn(state)
+                    except Exception as exc:
+                        duration_ms = (telemetry.now_ms() - t0) if t0 is not None and hasattr(telemetry, "now_ms") else None
+                        emit(
+                            node_name,
+                            f"Node {node_name} lỗi: {exc}",
+                            node=node_name,
+                            event_type="node_error",
+                            agent_role=role,
+                            status="error",
+                            duration_ms=duration_ms,
+                            retry_count=retry_count,
+                            review_cycle=review_cycle,
+                            error=str(exc),
+                        )
+                        raise
                     durable_step.set_output(output)
+                    duration_ms = (telemetry.now_ms() - t0) if t0 is not None and hasattr(telemetry, "now_ms") else None
+                    output_summary = _summarize_value(output) if isinstance(output, (dict, list)) else None
+                    try:
+                        token_delta = telemetry.get_token_usage_delta() if hasattr(telemetry, "get_token_usage_delta") else None
+                    except Exception:
+                        token_delta = None
                     # Emit node_end for lifecycle tracking
-                    emit(node_name, f"Node {node_name} hoàn tất")
+                    emit(
+                        node_name,
+                        f"Node {node_name} hoàn tất",
+                        node=node_name,
+                        event_type="node_completed",
+                        agent_role=role,
+                        status="completed",
+                        duration_ms=duration_ms,
+                        retry_count=retry_count,
+                        review_cycle=review_cycle,
+                        output_summary=output_summary,
+                        token_usage=token_delta,
+                    )
                     return output
 
         return wrapped

@@ -37,7 +37,27 @@ class DeterministicWorkflowTests(unittest.TestCase):
             "execution_gate",
         )
         self.assertEqual(workflow.route("execution_gate", {"auto_rework_granted": True}), "openhands_worker")
-        self.assertEqual(workflow.route("execution_gate", {"auto_rework_granted": False}), "reporter_end")
+        # When auto-rework is exhausted, route MUST land on the reporter so
+        # assistantText is assembled and finalize_workspace runs — routing
+        # to a no-op `reporter_end` is the v5 hang bug we're guarding against.
+        self.assertEqual(workflow.route("execution_gate", {"auto_rework_granted": False}), "reporter")
+        # Blocked verdict must also flow through reporter (assembles
+        # assistantText including review.blockers) so the run completes.
+        self.assertEqual(
+            workflow.route(
+                "reviewer_decision",
+                {
+                    "has_result": False,
+                    "worker_error": False,
+                    "review_passed": False,
+                    "changes_required": False,
+                    "replan_required": False,
+                    "blocked": True,
+                    "can_rework": False,
+                },
+            ),
+            "reporter",
+        )
         self.assertEqual(workflow.limits["maxReworkAttempts"], 3)
         self.assertEqual(workflow.limits["maxAutoApprovalCycles"], 1)
 

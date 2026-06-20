@@ -24,14 +24,14 @@ function resolvePythonCommand(projectRoot = getProjectRoot()) {
   return { command: "python3", args: [] };
 }
 
-function buildPythonEnv({ projectRoot = getProjectRoot(), userDataPath } = {}) {
+function buildPythonEnv({ projectRoot = getProjectRoot(), userDataPath, fullPower } = {}) {
   const enginePath = path.join(projectRoot, "engine");
   const localBinPath = path.join(projectRoot, "node_modules", ".bin");
   const nextPath = process.env.PATH
     ? `${localBinPath}${path.delimiter}${process.env.PATH}`
     : localBinPath;
 
-  return {
+  const env = {
     ...process.env,
     PATH: nextPath,
     AGENT_ENGINE_STATE_DIR: userDataPath || process.env.AGENT_ENGINE_STATE_DIR || path.join(projectRoot, ".agent-state"),
@@ -42,6 +42,15 @@ function buildPythonEnv({ projectRoot = getProjectRoot(), userDataPath } = {}) {
     PYTHONUTF8: "1",
     PYTHONPATH: process.env.PYTHONPATH ? `${enginePath}${path.delimiter}${process.env.PYTHONPATH}` : enginePath
   };
+  // DANGEROUS — when fullPower.bypassSafeCommands is on, the agent can run
+  // arbitrary shell commands in your workspace. The Python side reads this
+  // env var in workspace.py:682 + :848 to skip both setup and verification
+  // allowlists. Keep this OFF unless the user explicitly opted in via the
+  // Full Power panel in the Settings tab.
+  if (fullPower?.bypassSafeCommands) {
+    env.AGENT_BYPASS_SAFE_COMMANDS = "1";
+  }
+  return env;
 }
 
 module.exports = {

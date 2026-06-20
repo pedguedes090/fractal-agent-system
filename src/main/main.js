@@ -18,6 +18,81 @@ const { AgentBackendService } = require("./backendService");
 const { SettingsStore } = require("./settingsStore");
 const { SessionStore } = require("./sessionStore");
 const { getWorkspaceDiff } = require("./workspaceDiff");
+const { execFileSync, spawn: childSpawn } = require("child_process");
+
+// ── UAC self-elevation (Windows) ──────────────────────────────────────────
+// Cheap synchronous check: `net session` requires admin privileges on Windows;
+// it exits 0 silently when elevated and prints "Access is denied" + exits non-zero
+// otherwise. Cached after first call.
+let _isElevatedCache = null;
+function isElevatedWindows() {
+  if (_isElevatedCache !== null) return _isElevatedCache;
+  if (process.platform !== "win32") { _isElevatedCache = false; return false; }
+  try {
+    execFileSync("net", ["session"], { stdio: "ignore", windowsHide: true, timeout: 3000 });
+    _isElevatedCache = true;
+  } catch {
+    _isElevatedCache = false;
+  }
+  return _isElevatedCache;
+}
+
+// Relaunch the current Electron app through PowerShell's "Start-Process -Verb RunAs"
+// which triggers the UAC consent prompt. The new process inherits the user's
+// Administrator token; this process then exits cleanly.
+//
+// Caller MUST ensure require_admin is the user's explicit choice (Full Power
+// panel). We refuse to elevate if AGENT_NO_ELEVATE=1 so a dev can debug
+// without the UAC dialog stealing focus on every relaunch.
+function relaunchElevatedWindows() {
+  if (process.env.AGENT_NO_ELEVATE === "1") {
+    console.warn("AGENT_NO_ELEVATE=1 — skipping UAC relaunch.");
+    return false;
+  }
+  try {
+    const exe = process.execPath;
+    // In dev mode (`electron .`), argv = [electron.exe, ".", ...userArgs] and
+    // cwd is the project root. The relaunched elevated Electron loses its cwd
+    // (Start-Process defaults to System32) so we MUST pass -WorkingDirectory.
+    //
+    // For packaged builds, process.execPath IS the app exe and argv[1..] is
+    // safe to forward.
+    //
+    // We also need to detect dev mode and forward "." (or the resolved app
+    // path) as the first arg so elevated electron knows where to find
+    // package.json + main.js. Heuristic: process.defaultApp is true when
+    // running via the system electron CLI.
+    const isDev = !!process.defaultApp;
+    const cwd = process.cwd();
+    const forwardArgs = isDev
+      // Dev: skip argv[1] (which was "." resolved from current cwd) and
+      // explicitly pass the cwd as the app entry so it resolves correctly
+      // even when Start-Process changes the working directory.
+      ? [cwd, ...process.argv.slice(2)]
+      : process.argv.slice(1);
+
+    const quote = (s) => `'${String(s).replace(/'/g, "''")}'`;
+    const psParts = [
+      `-FilePath ${quote(exe)}`,
+      `-WorkingDirectory ${quote(cwd)}`,
+      "-Verb RunAs"
+    ];
+    if (forwardArgs.length) {
+      psParts.push(`-ArgumentList ${forwardArgs.map(quote).join(",")}`);
+    }
+    const psCommand = `Start-Process ${psParts.join(" ")}`;
+    childSpawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", psCommand], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      cwd
+    }).unref();
+    return true;
+  } catch (err) {
+    console.error("Elevation relaunch failed:", err);
+    return false;
+  }
+}
 
 let mainWindow;
 let appDatabase;
@@ -187,6 +262,24 @@ function registerIpc() {
 
   ipcMain.handle("agent:autonomy-scan", async (_event, payload) => {
     return backendService.runAutonomyScan({ workspacePath: payload?.workspacePath || "" });
+  });
+
+  ipcMain.handle("agent:full-power-status", async () => {
+    const s = settingsStore.get();
+    return {
+      isElevated: process.platform === "win32" ? isElevatedWindows() : false,
+      platform: process.platform,
+      fullPower: s?.fullPower || { bypassSafeCommands: false, requireAdmin: false, autoLoopAllowAdmin: false }
+    };
+  });
+
+  ipcMain.handle("agent:autonomy-next-task", async (_event, payload) => {
+    return backendService.requestAutonomyNextTask({
+      workspacePath: payload?.workspacePath || "",
+      completedIds: payload?.completedIds || [],
+      ideaCursor: payload?.ideaCursor || 0,
+      rescanIfStale: !!payload?.rescanIfStale,
+    });
   });
 
   ipcMain.handle("agent:topology", async () => {
@@ -420,11 +513,49 @@ app.whenReady().then(async () => {
   appDatabase = new AppDatabase(userDataPath);
   settingsStore = new SettingsStore(appDatabase, userDataPath);
   sessionStore = new SessionStore(appDatabase, userDataPath);
+
+  // Full Power: if requireAdmin is on and we are not already elevated, relaunch
+  // through UAC and bail out. Done BEFORE backend spawn so the Python process
+  // inherits the Administrator token. Honored only on Windows.
+  //
+  // Anti-loop guard: if the last elevation attempt happened < 30s ago, skip —
+  // the previous attempt is probably still loading, or it crashed and we'd
+  // spin forever. Stamp the attempt time on disk so concurrent launches see it.
+  try {
+    const requireAdmin = !!settingsStore.get()?.fullPower?.requireAdmin;
+    if (requireAdmin && process.platform === "win32" && !isElevatedWindows()) {
+      const stampPath = path.join(userDataPath, "elevation-attempt.txt");
+      let lastAttempt = 0;
+      try { lastAttempt = parseInt(require("fs").readFileSync(stampPath, "utf8"), 10) || 0; } catch {}
+      const sinceMs = Date.now() - lastAttempt;
+      if (lastAttempt && sinceMs < 30000) {
+        console.warn(`Elevation requested ${Math.round(sinceMs/1000)}s ago — skipping to avoid loop.`);
+        // Auto-disable the flag so the user can recover via UI even if UAC
+        // keeps failing. They can re-enable after fixing the root cause.
+        const s = settingsStore.get();
+        settingsStore.save({ ...s, fullPower: { ...s.fullPower, requireAdmin: false } });
+        console.warn("Auto-disabled fullPower.requireAdmin to break the loop. Re-enable in Settings when ready.");
+      } else {
+        try { require("fs").writeFileSync(stampPath, String(Date.now()), "utf8"); } catch {}
+        const relaunched = relaunchElevatedWindows();
+        if (relaunched) {
+          console.warn("Relaunching with Administrator privileges via UAC…");
+          app.exit(0);
+          return;
+        }
+        console.warn("UAC relaunch failed; continuing without elevation.");
+      }
+    }
+  } catch (e) {
+    console.warn("Elevation check failed:", e?.message || e);
+  }
   const appRecovery = sessionStore.reconcileStartupState();
   if (appRecovery.recoveredRuns) {
     console.warn(`Recovered ${appRecovery.recoveredRuns} non-terminal UI run(s) in app DB.`);
   }
-  backendService = new AgentBackendService(userDataPath);
+  backendService = new AgentBackendService(userDataPath, {
+    getSettings: () => settingsStore.get()
+  });
   registerIpc();
   createWindow();
   backendService.start().catch((error) => {

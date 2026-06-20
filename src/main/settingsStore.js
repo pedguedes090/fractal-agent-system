@@ -10,7 +10,23 @@ const DEFAULT_SETTINGS = {
   autoConfirmHumanGate: false,
   directWorkspaceMode: true,
   modelOverrides: {},
-  bypassPolicy: false
+  bypassPolicy: false,
+  theme: "auto",
+  // ── DANGEROUS — read explanation in UI Full Power panel before enabling ──
+  // bypassSafeCommands: sets AGENT_BYPASS_SAFE_COMMANDS=1 → setup + verification
+  //   commands are no longer matched against an allowlist; the agent can run
+  //   ARBITRARY shell commands in your opened workspace.
+  // requireAdmin: app self-elevates via UAC on next launch (Windows). The
+  //   Python backend then inherits Administrator token — file ACLs, registry,
+  //   service control, system folders are all writable.
+  // autoLoopAllowAdmin: explicit second consent so the Auto Loop (which submits
+  //   tasks WITHOUT human review between iterations) can keep running while
+  //   elevated. Default false even when requireAdmin=true.
+  fullPower: {
+    bypassSafeCommands: false,
+    requireAdmin: false,
+    autoLoopAllowAdmin: false
+  }
 };
 
 function ensureDir(dirPath) {
@@ -119,7 +135,15 @@ class SettingsStore {
         ? Boolean(nextSettings.directWorkspaceMode)
         : Boolean(current.directWorkspaceMode),
       modelOverrides: nextSettings.modelOverrides || current.modelOverrides || {},
-      bypassPolicy: Boolean(nextSettings.bypassPolicy)
+      bypassPolicy: Boolean(nextSettings.bypassPolicy),
+      theme: ["auto", "light", "dark"].includes(String(nextSettings.theme))
+        ? String(nextSettings.theme)
+        : (current.theme || "auto"),
+      fullPower: {
+        bypassSafeCommands: Boolean(nextSettings.fullPower?.bypassSafeCommands),
+        requireAdmin: Boolean(nextSettings.fullPower?.requireAdmin),
+        autoLoopAllowAdmin: Boolean(nextSettings.fullPower?.autoLoopAllowAdmin)
+      }
     };
     const finalSettings = {
       ...DEFAULT_SETTINGS,

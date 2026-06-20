@@ -136,7 +136,17 @@ const state = {
   autonomyScanning: false,
   autonomyAutoScanScheduled: false,
   running: false,
-  activeTask: ""
+  activeTask: "",
+  autoLoop: {
+    enabled: false,
+    iterations: 0,
+    completedIds: [],
+    ideaCursor: 0,
+    log: [],
+    lastTask: null,
+    nextAttemptAt: null,
+    consecutiveErrors: 0
+  }
 };
 
 const WORKFLOW_GROUPS = [
@@ -234,6 +244,12 @@ const E = {
   get autoConfirmInput() { return _$("#autoConfirmInput"); },
   get directWorkspaceInput() { return _$("#directWorkspaceInput"); },
   get bypassPolicyInput() { return _$("#bypassPolicyInput"); },
+  get themeSelect() { return _$("#themeSelect"); },
+  get fpBypassSafeInput() { return _$("#fpBypassSafeInput"); },
+  get fpRequireAdminInput() { return _$("#fpRequireAdminInput"); },
+  get fpAutoLoopAllowAdminInput() { return _$("#fpAutoLoopAllowAdminInput"); },
+  get fpStatusBadge() { return _$("#fpStatusBadge"); },
+  get fullPowerHeaderBadge() { return _$("#fullPowerHeaderBadge"); },
   get plannerModelInput() { return _$("#plannerModelInput"); },
   get coderModelInput() { return _$("#coderModelInput"); },
   get reviewerModelInput() { return _$("#reviewerModelInput"); },
@@ -255,6 +271,9 @@ const E = {
   get autonomyScanBtn() { return _$("#autonomyScanBtn"); },
   get autonomyStatus() { return _$("#autonomyStatus"); },
   get autonomySummary() { return _$("#autonomySummary"); },
+  get autoLoopToggleBtn() { return _$("#autoLoopToggleBtn"); },
+  get autoLoopStatus() { return _$("#autoLoopStatus"); },
+  get autoLoopLog() { return _$("#autoLoopLog"); },
   get execStream() { return _$("#execStream"); },
   get execProgress() { return _$("#execProgress"); },
   get reviewContent() { return _$("#reviewContent"); },
@@ -347,6 +366,29 @@ function nodeStatus(stage, indexData) {
   return "done";
 }
 
+// ── Theme: auto/light/dark ───────────────────────────────────────────────
+let _themeMql = null;
+function applyTheme(pref) {
+  const choice = ["auto", "light", "dark"].includes(pref) ? pref : "auto";
+  let resolved = choice;
+  if (choice === "auto") {
+    resolved = window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  document.documentElement.setAttribute("data-theme", resolved);
+  // Auto-track OS changes only when user picked "auto".
+  if (_themeMql) {
+    try { _themeMql.removeEventListener("change", _themeMqlHandler); } catch {}
+    _themeMql = null;
+  }
+  if (choice === "auto" && window.matchMedia) {
+    _themeMql = window.matchMedia("(prefers-color-scheme: dark)");
+    try { _themeMql.addEventListener("change", _themeMqlHandler); } catch {}
+  }
+}
+function _themeMqlHandler(e) {
+  document.documentElement.setAttribute("data-theme", e.matches ? "dark" : "light");
+}
+
 function renderSettings() {
   if (E.serverInput) E.serverInput.value = state.settings?.serverUrl || "";
   if (E.modelInput) E.modelInput.value = state.settings?.model || "";
@@ -357,6 +399,47 @@ function renderSettings() {
   if (E.plannerModelInput) E.plannerModelInput.value = state.settings?.modelOverrides?.planner || "";
   if (E.coderModelInput) E.coderModelInput.value = state.settings?.modelOverrides?.coder || "";
   if (E.reviewerModelInput) E.reviewerModelInput.value = state.settings?.modelOverrides?.reviewer || "";
+  if (E.themeSelect) E.themeSelect.value = state.settings?.theme || "auto";
+  applyTheme(state.settings?.theme || "auto");
+  const fp = state.settings?.fullPower || {};
+  if (E.fpBypassSafeInput) E.fpBypassSafeInput.checked = !!fp.bypassSafeCommands;
+  if (E.fpRequireAdminInput) E.fpRequireAdminInput.checked = !!fp.requireAdmin;
+  if (E.fpAutoLoopAllowAdminInput) E.fpAutoLoopAllowAdminInput.checked = !!fp.autoLoopAllowAdmin;
+  renderFullPowerStatus();
+}
+
+function renderFullPowerStatus() {
+  const fp = state.settings?.fullPower || {};
+  const st = state.fullPowerStatus || {};
+  const isElevated = !!st.isElevated;
+  const lines = [];
+  if (isElevated) lines.push("⚠ Đang chạy với quyền Administrator.");
+  if (fp.bypassSafeCommands) lines.push("• Allowlist OFF — agent có thể chạy bất kỳ lệnh shell nào.");
+  if (fp.requireAdmin) lines.push("• Require Admin: ON (lần khởi động kế tiếp sẽ trigger UAC nếu chưa elevated).");
+  if (fp.autoLoopAllowAdmin) lines.push("• Auto Loop được phép chạy khi elevated.");
+  if (E.fpStatusBadge) {
+    E.fpStatusBadge.textContent = lines.length ? lines.join("\n") : "Tất cả full-power flags đang TẮT.";
+  }
+  if (E.fullPowerHeaderBadge) {
+    const active = isElevated || fp.bypassSafeCommands;
+    E.fullPowerHeaderBadge.style.display = active ? "inline-block" : "none";
+    E.fullPowerHeaderBadge.textContent = isElevated && fp.bypassSafeCommands
+      ? "⚠ ADMIN + FULL POWER"
+      : isElevated
+        ? "⚠ ADMIN"
+        : "⚠ FULL POWER";
+    E.fullPowerHeaderBadge.title = lines.join(" · ");
+  }
+}
+
+async function refreshFullPowerStatus() {
+  if (typeof appApi.getFullPowerStatus !== "function") return;
+  try {
+    state.fullPowerStatus = await appApi.getFullPowerStatus();
+  } catch (e) {
+    state.fullPowerStatus = { isElevated: false, error: e.message };
+  }
+  renderFullPowerStatus();
 }
 
 function renderWorkspace() {
@@ -839,6 +922,200 @@ function scheduleIdleAutonomyScan() {
   }, 1800);
 }
 
+// ── Auto Loop: continuously pick a finding/idea and submit it as a task ─────
+const AUTO_LOOP_STORAGE_KEY = "fractal.autoLoop.v1";
+const AUTO_LOOP_MAX_LOG = 80;
+const AUTO_LOOP_BACKOFF_MS = 4000;
+const AUTO_LOOP_MAX_CONSECUTIVE_ERRORS = 3;
+
+function autoLoopLog(message, level = "info") {
+  const at = new Date().toISOString();
+  const entry = { at, level, message };
+  state.autoLoop.log.unshift(entry);
+  if (state.autoLoop.log.length > AUTO_LOOP_MAX_LOG) state.autoLoop.log.length = AUTO_LOOP_MAX_LOG;
+  renderAutoLoop();
+}
+
+function persistAutoLoop() {
+  try {
+    localStorage.setItem(AUTO_LOOP_STORAGE_KEY, JSON.stringify({
+      enabled: !!state.autoLoop.enabled,
+      iterations: state.autoLoop.iterations,
+      completedIds: state.autoLoop.completedIds.slice(-200),
+      ideaCursor: state.autoLoop.ideaCursor
+    }));
+  } catch {}
+}
+
+function restoreAutoLoop() {
+  try {
+    const raw = localStorage.getItem(AUTO_LOOP_STORAGE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    state.autoLoop.iterations = Number(saved.iterations || 0);
+    state.autoLoop.completedIds = Array.isArray(saved.completedIds) ? saved.completedIds : [];
+    state.autoLoop.ideaCursor = Number(saved.ideaCursor || 0);
+    // Do NOT auto-restore "enabled=true" — require explicit user toggle each session
+    // so a stuck loop from a previous session doesn't fire on relaunch.
+  } catch {}
+}
+
+async function autoLoopTick() {
+  if (!state.autoLoop.enabled) return;
+  if (state.running || state.autonomyScanning) return;
+  const workspace = getWorkspacePath();
+  if (!workspace) {
+    autoLoopLog("Chưa mở workspace — Auto Loop tạm dừng.", "warn");
+    autoLoopSetEnabled(false);
+    return;
+  }
+  if (typeof appApi.requestAutonomyNextTask !== "function") {
+    autoLoopLog("Backend chưa hỗ trợ next-task endpoint.", "error");
+    autoLoopSetEnabled(false);
+    return;
+  }
+
+  try {
+    const rescanIfStale = state.autoLoop.iterations === 0 || (state.autoLoop.iterations % 5 === 0);
+    const reply = await appApi.requestAutonomyNextTask({
+      workspacePath: workspace,
+      completedIds: state.autoLoop.completedIds,
+      ideaCursor: state.autoLoop.ideaCursor,
+      rescanIfStale
+    });
+    if (!reply?.task) {
+      autoLoopLog("Không còn finding/ý tưởng nào — chờ scan mới.", "info");
+      // Schedule next attempt — after a rescan it should find ideas again.
+      scheduleAutoLoopTick(15000);
+      return;
+    }
+    state.autoLoop.ideaCursor = Number(reply.nextIdeaCursor || 0);
+    state.autoLoop.lastTask = reply.task;
+    state.autoLoop.iterations += 1;
+    state.autoLoop.completedIds.push(reply.task.id);
+    if (state.autoLoop.completedIds.length > 200) state.autoLoop.completedIds = state.autoLoop.completedIds.slice(-200);
+    persistAutoLoop();
+    const kind = reply.task.kind || "finding";
+    const cat = reply.task.category || "";
+    autoLoopLog(`#${state.autoLoop.iterations} [${kind}/${cat}] ${reply.task.title || reply.task.id}`, "task");
+    const runResult = await runTask(reply.task.task, {
+      startDetail: `Auto Loop · ${reply.task.title || reply.task.id}`
+    });
+    if (runResult?.ok) {
+      state.autoLoop.consecutiveErrors = 0;
+      autoLoopLog(`✓ Done iteration ${state.autoLoop.iterations}`, "ok");
+    } else {
+      state.autoLoop.consecutiveErrors += 1;
+      autoLoopLog(`✗ Iteration ${state.autoLoop.iterations} failed: ${runResult?.error || runResult?.reason || "unknown"}`, "error");
+      if (state.autoLoop.consecutiveErrors >= AUTO_LOOP_MAX_CONSECUTIVE_ERRORS) {
+        autoLoopLog(`Dừng Auto Loop vì ${AUTO_LOOP_MAX_CONSECUTIVE_ERRORS} lỗi liên tiếp.`, "error");
+        autoLoopSetEnabled(false);
+        return;
+      }
+    }
+    // runTask emits "agent:run-finished" → handler will schedule next tick.
+  } catch (error) {
+    state.autoLoop.consecutiveErrors += 1;
+    autoLoopLog(`Lỗi next-task: ${error.message}`, "error");
+    if (state.autoLoop.consecutiveErrors >= AUTO_LOOP_MAX_CONSECUTIVE_ERRORS) {
+      autoLoopSetEnabled(false);
+      return;
+    }
+    scheduleAutoLoopTick(AUTO_LOOP_BACKOFF_MS);
+  }
+}
+
+function scheduleAutoLoopTick(delayMs = 1500) {
+  if (!state.autoLoop.enabled) return;
+  state.autoLoop.nextAttemptAt = Date.now() + delayMs;
+  renderAutoLoop();
+  setTimeout(() => {
+    if (!state.autoLoop.enabled) return;
+    autoLoopTick();
+  }, delayMs);
+}
+
+function autoLoopSetEnabled(enabled) {
+  // Safety guard: refuse to enable Auto Loop while the app is running with
+  // Administrator privileges, UNLESS the user explicitly opted in via the
+  // Full Power panel (autoLoopAllowAdmin). Auto Loop submits LLM-generated
+  // tasks without human review between iterations — combined with admin token
+  // and the bypassSafeCommands env, an errant task could brick Windows.
+  if (enabled) {
+    const elevated = !!state.fullPowerStatus?.isElevated;
+    const consent = !!state.settings?.fullPower?.autoLoopAllowAdmin;
+    if (elevated && !consent) {
+      const ok = window.confirm(
+        "Ứng dụng đang chạy với quyền Administrator.\n\n" +
+        "Auto Loop sẽ gửi task tự sinh không có review giữa các lần chạy. " +
+        "Kết hợp với admin + bypass allowlist, một task LLM sai có thể xoá file, " +
+        "đổi registry, hoặc làm hỏng Windows.\n\n" +
+        "Để bật Auto Loop khi đang elevated, vào Cài đặt → Full Power Mode và bật " +
+        "\"Allow Auto Loop while elevated\" rồi thử lại.\n\n" +
+        "Click OK để mở Cài đặt."
+      );
+      if (ok) {
+        const drawer = document.getElementById("settingsDrawer");
+        if (drawer) drawer.classList.add("open");
+      }
+      return;
+    }
+  }
+  state.autoLoop.enabled = !!enabled;
+  if (state.autoLoop.enabled) {
+    state.autoLoop.consecutiveErrors = 0;
+    autoLoopLog("Bật Auto Loop", "info");
+  } else {
+    autoLoopLog("Tắt Auto Loop", "info");
+    state.autoLoop.nextAttemptAt = null;
+  }
+  persistAutoLoop();
+  renderAutoLoop();
+  if (state.autoLoop.enabled && !state.running) scheduleAutoLoopTick(800);
+}
+
+function renderAutoLoop() {
+  const statusEl = E.autoLoopStatus;
+  const btn = E.autoLoopToggleBtn;
+  const logEl = E.autoLoopLog;
+  if (btn) {
+    btn.textContent = state.autoLoop.enabled ? "Tắt Auto Loop" : "Bật Auto Loop";
+    btn.classList.toggle("active", state.autoLoop.enabled);
+  }
+  if (statusEl) {
+    if (!state.autoLoop.enabled) {
+      statusEl.textContent = `Tắt — đã chạy ${state.autoLoop.iterations} iteration${state.autoLoop.iterations === 1 ? "" : "s"} trước đó.`;
+    } else if (state.running) {
+      statusEl.textContent = `Đang chạy iteration #${state.autoLoop.iterations} · ${state.autoLoop.lastTask?.title || state.autoLoop.lastTask?.id || "task"}`;
+    } else if (state.autoLoop.nextAttemptAt) {
+      const ms = Math.max(0, state.autoLoop.nextAttemptAt - Date.now());
+      statusEl.textContent = `Chờ iteration kế tiếp (~${Math.ceil(ms / 1000)}s) · đã hoàn tất ${state.autoLoop.iterations}.`;
+    } else {
+      statusEl.textContent = `Đang chọn task… · đã hoàn tất ${state.autoLoop.iterations}.`;
+    }
+  }
+  if (logEl) {
+    if (!state.autoLoop.log.length) {
+      logEl.innerHTML = `<p class="muted" style="margin:0">Chưa có hoạt động.</p>`;
+    } else {
+      const escape = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+      const colorOf = (lvl) => ({ ok: "#6ee7b7", error: "#fca5a5", warn: "#fde68a", task: "#93c5fd", info: "#cbd5e1" }[lvl] || "#cbd5e1");
+      logEl.innerHTML = state.autoLoop.log.slice(0, 40).map((e) => {
+        const t = (e.at || "").slice(11, 19);
+        return `<div style="display:flex;gap:6px;padding:2px 0">
+          <span style="color:#64748b;font-family:monospace;font-size:10.5px">${escape(t)}</span>
+          <span style="color:${colorOf(e.level)}">${escape(e.message)}</span>
+        </div>`;
+      }).join("");
+    }
+  }
+}
+
+window.addEventListener("agent:run-finished", () => {
+  if (!state.autoLoop.enabled) return;
+  scheduleAutoLoopTick(2000);
+});
+
 async function ensureSession() {
   if (state.activeSession) return state.activeSession;
   const result = await appApi.createSession({ workspacePath: "" });
@@ -855,6 +1132,12 @@ async function saveSettings() {
     autoConfirmHumanGate: E.autoConfirmInput?.checked ?? state.settings?.autoConfirmHumanGate ?? false,
     directWorkspaceMode: E.directWorkspaceInput?.checked ?? state.settings?.directWorkspaceMode ?? true,
     bypassPolicy: E.bypassPolicyInput?.checked ?? state.settings?.bypassPolicy ?? false,
+    theme: E.themeSelect?.value || state.settings?.theme || "auto",
+    fullPower: {
+      bypassSafeCommands: E.fpBypassSafeInput?.checked ?? state.settings?.fullPower?.bypassSafeCommands ?? false,
+      requireAdmin: E.fpRequireAdminInput?.checked ?? state.settings?.fullPower?.requireAdmin ?? false,
+      autoLoopAllowAdmin: E.fpAutoLoopAllowAdminInput?.checked ?? state.settings?.fullPower?.autoLoopAllowAdmin ?? false
+    },
     modelOverrides: {
       planner: E.plannerModelInput?.value?.trim?.() || state.settings?.modelOverrides?.planner || null,
       coder: E.coderModelInput?.value?.trim?.() || state.settings?.modelOverrides?.coder || null,
@@ -862,7 +1145,17 @@ async function saveSettings() {
     }
   });
   renderSettings();
-  setStatus("Đã lưu");
+  await refreshFullPowerStatus();
+  // Notify the user that requireAdmin only takes effect at next launch — the
+  // running backend already inherited its env. A backend restart would be
+  // nicer UX but currently the renderer can't trigger that safely.
+  if (state.settings?.fullPower?.requireAdmin && !state.fullPowerStatus?.isElevated) {
+    setStatus("Đã lưu · Khởi động lại app để UAC elevate", 4000);
+  } else if (state.settings?.fullPower?.bypassSafeCommands) {
+    setStatus("Đã lưu · Khởi động lại app để bypass áp dụng cho backend đang chạy", 4000);
+  } else {
+    setStatus("Đã lưu");
+  }
 }
 
 function resetFlowView() {
@@ -916,12 +1209,19 @@ async function sendMessage(event) {
   if (event && typeof event.preventDefault === "function") event.preventDefault();
   const content = (E.messageInput?.value || "").trim();
   if (!content || state.running) return;
+  E.messageInput.value = "";
+  E.messageInput.style.height = "auto";
+  await runTask(content);
+}
+
+async function runTask(content, opts = {}) {
+  if (!content || state.running) return { ok: false, reason: "busy" };
 
   await saveSettings();
   const session = await ensureSession();
   if (!getWorkspacePath()) {
     setStatus("Hãy mở thư mục trước", 2600);
-    return;
+    return { ok: false, reason: "no_workspace" };
   }
 
   state.running = true;
@@ -929,7 +1229,7 @@ async function sendMessage(event) {
   state.progress = [
     {
       stage: "running",
-      detail: "Bắt đầu chạy pipeline",
+      detail: opts.startDetail || "Bắt đầu chạy pipeline",
       at: new Date().toISOString()
     }
   ];
@@ -937,8 +1237,6 @@ async function sendMessage(event) {
   // Clear FlowView before this run starts so we don't display stale nodes
   // from a previous task in the same session.
   resetFlowView();
-  E.messageInput.value = "";
-  E.messageInput.style.height = "auto";
   render();
 
   try {
@@ -979,14 +1277,23 @@ async function sendMessage(event) {
     if (result?.error) setStatus(result.error, 3600);
     await refreshObservability();
     scheduleIdleAutonomyScan();
-  } catch (error) {
-    setStatus(`Chưa gửi được yêu cầu: ${error.message}`, 3600);
-  } finally {
     state.running = false;
     state.currentExecutionId = null;
     window.__currentSendController = null;
     render();
-    E.messageInput.focus();
+    if (E.messageInput) E.messageInput.focus();
+    // Notify the auto-loop scheduler this run finished so it can pick the next task.
+    try { window.dispatchEvent(new CustomEvent("agent:run-finished", { detail: { ok: true, result } })); } catch {}
+    return { ok: true, result };
+  } catch (error) {
+    setStatus(`Chưa gửi được yêu cầu: ${error.message}`, 3600);
+    state.running = false;
+    state.currentExecutionId = null;
+    window.__currentSendController = null;
+    render();
+    if (E.messageInput) E.messageInput.focus();
+    try { window.dispatchEvent(new CustomEvent("agent:run-finished", { detail: { ok: false, error: error.message } })); } catch {}
+    return { ok: false, error: error.message };
   }
 }
 
@@ -1033,6 +1340,8 @@ async function init() {
     state.settings = initial.settings || {};
     state.sessions = (initial.sessions && initial.sessions.sessions) ? initial.sessions.sessions : [];
     state.activeSession = initial.activeSession || null;
+    // Apply theme as early as possible to avoid a flash of the wrong palette.
+    applyTheme(state.settings.theme || "auto");
 
     // If we got a backend response but no settings, bootstrap defaults
     if (!state.settings.serverUrl) {
@@ -1149,6 +1458,13 @@ E.messageInput?.addEventListener("keydown", (event) => {
 });
 E.refreshObservabilityBtn?.addEventListener("click", refreshObservability);
 E.autonomyScanBtn?.addEventListener("click", () => performAutonomyScan({ automatic: false }));
+E.themeSelect?.addEventListener("change", () => applyTheme(E.themeSelect.value));
+E.autoLoopToggleBtn?.addEventListener("click", () => autoLoopSetEnabled(!state.autoLoop.enabled));
+restoreAutoLoop();
+renderAutoLoop();
+refreshFullPowerStatus();
+// Refresh the countdown badge every second so the user sees real-time progress.
+setInterval(() => { if (state.autoLoop.enabled) renderAutoLoop(); }, 1000);
 
 // ============ Tab switching ============
 function setupTabs() {
