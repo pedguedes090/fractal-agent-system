@@ -228,14 +228,15 @@ def run_claude_code_worker(
         if mcp_servers:
             for t in ("search_graph", "trace_path", "get_architecture", "get_code_snippet", "search_code", "index_status"):
                 allowed.append(f"mcp__codebase-memory__{t}")
+        # Cap agent turns so it cannot loop forever (was the 1h hang root cause).
+        _max_turns = int(os.environ.get("AGENT_CODER_MAX_TURNS", "40"))
         opts_kwargs: dict[str, Any] = {
             "cwd": str(workspace),
             "allowed_tools": allowed,
             "model": model or "claude-opus-4-8",
             "permission_mode": "acceptEdits",
-            # Token-by-token streaming so the Stream subtab updates live instead
-            # of in per-turn lumps. Tolerated-and-dropped if the SDK is older.
             "include_partial_messages": True,
+            "max_turns": _max_turns,
         }
         if mcp_servers:
             opts_kwargs["mcp_servers"] = mcp_servers

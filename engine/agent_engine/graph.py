@@ -1306,12 +1306,38 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         problem = _normalize_problem(problem, state)
         return {"problem": problem}
 
+    # ── 10-PLAN COUNCIL: each planner gets a distinct architectural lens ──
+    _PLAN_LENSES = [
+        ("minimal", "Bare-minimum MVP: what is the simplest thing that works end-to-end? Skip bells and whistles. Fewest files, fewest deps, fewest steps. Ship in 30 min."),
+        ("robust", "Production-grade: full error handling, validation, edge cases, auth if needed, env config, retry logic. Plan for scale even if MVP."),
+        ("test_first", "Test-first TDD: write the test file stubs first, then plan the implementation to make them pass. Every acceptance criterion gets a test."),
+        ("zero_to_one", "Product-first: identify the SINGLE core user action, build ONLY that path. Nothing else matters. One file if possible. Get the core working."),
+        ("user_journey", "UX-first: map the user's happy path step-by-step from open to goal complete. Plan UI components, states (loading/empty/error/edge), transitions."),
+        ("data_model", "Schema-first: define TypeScript interfaces/types, DB schema, API contracts BEFORE any React component. Types drive implementation."),
+        ("component_tree", "Component-first: design the React component tree (parent/child/props), CSS module structure. Atomic design: atoms→molecules→organisms→pages."),
+        ("spec_document", "Spec-first: write a detailed specification document (WHAT, not HOW). Define acceptance criteria, edge case table, non-goals. Then plan implementation from spec."),
+        ("perf_budget", "Perf-first: set bandwidth/bundle-size/render budgets. Lazy load, code split, tree shake, memoize from day one. No 2MB bundle on first load."),
+        ("a11y_first", "Accessibility-first: WCAG 2.1 AA from the start. Semantic HTML, ARIA labels, keyboard nav, screen-reader testing, color contrast, focus management."),
+    ]
+
+    _CRITIQUE_LENSES = [
+        ("risk", "Risk analysis: what can go wrong? Security holes, data loss, crash, race condition, memory leak. Score each risk and propose mitigation."),
+        ("test_coverage", "Test coverage: what tests are missing? Unit, integration, E2E, snapshot, a11y, perf. Which edge cases have no test?"),
+        ("security_regression", "Security+regression: inject malicious input, check XSS/CSRF/injection. Verify existing tests still pass. Check for regression risks."),
+        ("architecture_fit", "Architecture fit: does this plan fit the existing codebase patterns? Or introduce inconsistency? Check naming, module structure, import patterns."),
+        ("completeness", "Completeness: what is NOT covered? Missing states, missing API endpoints, missing error handling, missing docs. What does the plan forget?"),
+    ]
+
     def plan_node(name: str, focus: str):
         def node(state: PipelineState) -> dict[str, Any]:
             emit(f"planning_{name}", focus)
             plan = _json(
                 state,
-                f"Read-only Planning Agent {name}: {focus}. Return JSON with name, rationale, steps[], filesToRead[], filesLikelyToEdit[], commandsToRun[], risks[].\n"
+                f"Planning Agent [{name}]: {focus}\n"
+                f"You are ONE of 10 parallel planning agents. Each agent brings a DIFFERENT perspective.\n"
+                f"Your lens is: {focus}. Argue YOUR perspective strongly — but be open to synthesis.\n"
+                f"Return JSON: name, rationale (why your approach wins), steps[] (ordered, concrete), "
+                f"filesToRead[], filesLikelyToEdit[], commandsToRun[], risks[], estimatedMinutes.\n"
                 + json.dumps(_context(state, f"planning_{name}"), ensure_ascii=False),
                 {"name": name, "steps": [], "filesToRead": [], "filesLikelyToEdit": [], "commandsToRun": [], "risks": []},
                 role="planner",
@@ -1325,9 +1351,14 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
             emit(f"critique_{name}", focus)
             critique = _json(
                 state,
-                f"Critique Layer {name}: {focus}. Return JSON with blockers[], warnings[], riskClass, acceptanceCriteria[], reviewFocus[], requiredCommands[].\n"
+                f"Critique Agent [{name}]: {focus}\n"
+                f"You review ALL {len(_PLAN_LENSES)} candidate plans through your lens: {focus}.\n"
+                f"Return JSON: blockers[] (must-fix), warnings[] (should-fix), riskClass, "
+                f"acceptanceCriteria[], reviewFocus[], requiredCommands[], "
+                f"scores: {{planName: 1-10}} (rate EVERY plan on your dimension).\n"
                 + json.dumps(_context(state, f"critique_{name}"), ensure_ascii=False),
-                {"blockers": [], "warnings": [], "riskClass": state["problem"].get("riskClass", "medium"), "acceptanceCriteria": [], "reviewFocus": [], "requiredCommands": []},
+                {"blockers": [], "warnings": [], "riskClass": state["problem"].get("riskClass", "medium"),
+                 "acceptanceCriteria": [], "reviewFocus": [], "requiredCommands": []},
                 role="reviewer",
             )
             return {
@@ -2556,9 +2587,18 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         "planning_minimal": "planner",
         "planning_robust": "planner",
         "planning_test_first": "planner",
+        "planning_zero_to_one": "planner",
+        "planning_user_journey": "planner",
+        "planning_data_model": "planner",
+        "planning_component_tree": "planner",
+        "planning_spec_document": "planner",
+        "planning_perf_budget": "planner",
+        "planning_a11y_first": "planner",
         "critique_risk": "critic",
         "critique_test_coverage": "critic",
         "critique_security_regression": "critic",
+        "critique_architecture_fit": "critic",
+        "critique_completeness": "critic",
         "plan_arbiter": "planner",
         "planner_task_graph": "planner",
         "researcher_context_agent": "researcher_context",
@@ -2738,9 +2778,18 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
     builder.add_node("planning_minimal", traced_node("planning_minimal", plan_node("minimal", "minimal plan")))
     builder.add_node("planning_robust", traced_node("planning_robust", plan_node("robust", "robust plan")))
     builder.add_node("planning_test_first", traced_node("planning_test_first", plan_node("test_first", "test-first plan")))
+    builder.add_node("planning_zero_to_one", traced_node("planning_zero_to_one", plan_node("zero_to_one", "zero-to-one plan")))
+    builder.add_node("planning_user_journey", traced_node("planning_user_journey", plan_node("user_journey", "user-journey plan")))
+    builder.add_node("planning_data_model", traced_node("planning_data_model", plan_node("data_model", "data-model plan")))
+    builder.add_node("planning_component_tree", traced_node("planning_component_tree", plan_node("component_tree", "component-tree plan")))
+    builder.add_node("planning_spec_document", traced_node("planning_spec_document", plan_node("spec_document", "spec-document plan")))
+    builder.add_node("planning_perf_budget", traced_node("planning_perf_budget", plan_node("perf_budget", "perf-budget plan")))
+    builder.add_node("planning_a11y_first", traced_node("planning_a11y_first", plan_node("a11y_first", "a11y-first plan")))
     builder.add_node("critique_risk", traced_node("critique_risk", critique_node("risk", "risk")))
     builder.add_node("critique_test_coverage", traced_node("critique_test_coverage", critique_node("test_coverage", "test coverage")))
     builder.add_node("critique_security_regression", traced_node("critique_security_regression", critique_node("security_regression", "security/regression")))
+    builder.add_node("critique_architecture_fit", traced_node("critique_architecture_fit", critique_node("architecture_fit", "architecture fit")))
+    builder.add_node("critique_completeness", traced_node("critique_completeness", critique_node("completeness", "completeness")))
     builder.add_node("plan_arbiter", traced_node("plan_arbiter", plan_arbiter))
     builder.add_node("planner_task_graph", traced_node("planner_task_graph", planner_task_graph))
     builder.add_node("researcher_context_agent", traced_node("researcher_context_agent", researcher_context_agent))

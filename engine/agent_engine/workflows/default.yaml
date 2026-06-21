@@ -17,9 +17,18 @@ nodes:
   - planning_minimal
   - planning_robust
   - planning_test_first
+  - planning_zero_to_one
+  - planning_user_journey
+  - planning_data_model
+  - planning_component_tree
+  - planning_spec_document
+  - planning_perf_budget
+  - planning_a11y_first
   - critique_risk
   - critique_test_coverage
   - critique_security_regression
+  - critique_architecture_fit
+  - critique_completeness
   - plan_arbiter
   - planner_task_graph
   - researcher_context_agent
@@ -47,6 +56,13 @@ edges:
   - [intake_synthesizer, planning_minimal]
   - [intake_synthesizer, planning_robust]
   - [intake_synthesizer, planning_test_first]
+  - [intake_synthesizer, planning_zero_to_one]
+  - [intake_synthesizer, planning_user_journey]
+  - [intake_synthesizer, planning_data_model]
+  - [intake_synthesizer, planning_component_tree]
+  - [intake_synthesizer, planning_spec_document]
+  - [intake_synthesizer, planning_perf_budget]
+  - [intake_synthesizer, planning_a11y_first]
   - [plan_arbiter, planner_task_graph]
   - [planner_task_graph, researcher_context_agent]
   - [researcher_context_agent, governance_service]
@@ -70,13 +86,17 @@ fanOut:
 joins:
   - sources: [intake_user_intent, intake_ambiguity, intake_repo_context]
     target: intake_synthesizer
-  - sources: [planning_minimal, planning_robust, planning_test_first]
+  - sources: [planning_minimal, planning_robust, planning_test_first, planning_zero_to_one, planning_user_journey, planning_data_model, planning_component_tree, planning_spec_document, planning_perf_budget, planning_a11y_first]
     target: critique_risk
-  - sources: [planning_minimal, planning_robust, planning_test_first]
+  - sources: [planning_minimal, planning_robust, planning_test_first, planning_zero_to_one, planning_user_journey, planning_data_model, planning_component_tree, planning_spec_document, planning_perf_budget, planning_a11y_first]
     target: critique_test_coverage
-  - sources: [planning_minimal, planning_robust, planning_test_first]
+  - sources: [planning_minimal, planning_robust, planning_test_first, planning_zero_to_one, planning_user_journey, planning_data_model, planning_component_tree, planning_spec_document, planning_perf_budget, planning_a11y_first]
     target: critique_security_regression
-  - sources: [critique_risk, critique_test_coverage, critique_security_regression]
+  - sources: [planning_minimal, planning_robust, planning_test_first, planning_zero_to_one, planning_user_journey, planning_data_model, planning_component_tree, planning_spec_document, planning_perf_budget, planning_a11y_first]
+    target: critique_architecture_fit
+  - sources: [planning_minimal, planning_robust, planning_test_first, planning_zero_to_one, planning_user_journey, planning_data_model, planning_component_tree, planning_spec_document, planning_perf_budget, planning_a11y_first]
+    target: critique_completeness
+  - sources: [critique_risk, critique_test_coverage, critique_security_regression, critique_architecture_fit, critique_completeness]
     target: plan_arbiter
 
 routes:
