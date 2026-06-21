@@ -1626,21 +1626,13 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         return {"contextFiles": files, "workerContext": worker_context}
 
     def openhands_worker(state: PipelineState) -> dict[str, Any]:
-        """FULL THROTTLE 20-agent coding mesh — work-stealing + A2A inter-agent comms.
-
-        - 1 shared git worktree (zero per-worker clone delay).
-        - Work-stealing queue: agent finishes its task → immediately grabs next.
-        - A2A message bus: agents broadcast file changes so others avoid conflicts.
-        - No API semaphore — full 20 concurrent streams. Rate limits self-managed
-          by the SDK's built-in retry.
-        - All agents run until queue empty or every item passed.
+        """HIERARCHICAL SWARM MODE — 1 Root + ≤20 Lead + ≤200 Specialist (max depth 2).
+        SwarmOrchestrator manages full agent tree, A2A comms, file-ownership leases.
         """
-        import concurrent.futures
-        import queue
+        import concurrent.futures, queue, json as _json, re
+        from .hierarchical_orchestrator import SwarmOrchestrator, MAX_LEADS, MAX_SPECIALISTS_PER_LEAD
 
         spec = (state.get("workerContext") or {}).get("workerTaskSpec") or {}
-        task_graph = state.get("taskGraph") or {}
-        subtasks = list(task_graph.get("subtasks") or [])
         direct_workspace = bool((state.get("executionEnvironment") or {}).get("directWorkspace"))
         setup_results = list(state.get("setupCommandResults") or [])
         setup_completed = bool(state.get("setupCommandsCompleted"))
@@ -1652,24 +1644,61 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         api_key_val = runtime_settings().get("apiKey", "") or os.environ.get("ANTHROPIC_API_KEY", "")
         rework_ctx = state.get("latestReview")
         worker_attempt_base = (state.get("reworkCycle", 0) * 100) + state.get("retryCount", 0) + 1
-        _cancel_chk = (lambda eid=execution_id: is_cancelled(eid))
+        original_goal = (state.get("executionContext") or {}).get("originalUserGoal") or state.get("task", "")
+        max_concurrency = min(int(os.environ.get("AGENT_CODER_PARALLELISM", "20")), 20)
 
         from .claude_code_worker import run_claude_code_worker, _has_sdk as _ccw_has_sdk
         if not _ccw_has_sdk():
-            emit("openhands_worker", "claude-agent-sdk not installed — coder cannot run.")
-            return {
-                "workerAttempts": [{"error": "claude-agent-sdk not installed", "changedFiles": []}],
-                "retryCount": state.get("retryCount", 0) + 1,
-                "brokerEvents": state.get("brokerEvents", []),
-                "setupCommandResults": setup_results,
-                "setupCommandsCompleted": setup_completed,
-            }
+            emit("openhands_worker", "claude-agent-sdk not installed")
+            return {"workerAttempts": [{"error": "SDK missing", "changedFiles": []}],
+                    "retryCount": state.get("retryCount", 0) + 1, "brokerEvents": state.get("brokerEvents", []),
+                    "setupCommandResults": setup_results, "setupCommandsCompleted": setup_completed}
 
-        max_workers = min(int(os.environ.get("AGENT_CODER_PARALLELISM", "20")), 20)
+        # ── Init swarm ──
+        swarm = SwarmOrchestrator(execution_id=execution_id, workspace_path=source_workspace,
+                                   original_user_goal=original_goal, max_concurrency=max_concurrency)
+        root = swarm.spawn_root(model=coder_model)
+        emit("openhands_worker", f"🐝 ROOT={root.agent_id} · cap={MAX_LEADS}L×{MAX_SPECIALISTS_PER_LEAD}S")
 
-        # ── Extract failing file paths from tester diagnostics so the rework
-        #     coder targets specific files instead of exploring the whole codebase.
-        #     Without this, the agent wanders, hits max_turns, and produces 0 files.
+        # ── Analyze workspace → spawn Lead agents ──
+        from .hierarchical_orchestrator import LEAD_DOMAINS
+        _ws_files: set[str] = set()
+        try:
+            from .workspace import walk_workspace
+            _ws_files = {f["path"] for f in walk_workspace(source_workspace, max_files=300, max_depth=5)}
+        except Exception: pass
+        _domain_indicators = {
+            "frontend": {".tsx", ".jsx", ".vue", ".svelte", ".html", ".css"},
+            "backend": {".py", ".go", ".rs", ".java"},
+            "database": {".sql", ".prisma", "migrations/"},
+            "api": {"api/", "routes/", "controllers/"},
+            "authentication": {"auth", "login", "oauth", "jwt"},
+            "testing": {"test/", "tests/", "spec/", "__tests__/", ".test."},
+            "build_tooling": {"Dockerfile", "Makefile", ".github/workflows"},
+            "security": {".env", "vault", "cert", "ssl"},
+        }
+        _selected_domains = []
+        for domain in LEAD_DOMAINS:
+            if domain == "product_requirement": _selected_domains.append(domain); continue
+            if any(ind in p for p in _ws_files for ind in _domain_indicators.get(domain, set())): _selected_domains.append(domain)
+        if len(_selected_domains) < 3: _selected_domains = ["product_requirement","frontend","backend","testing","build_tooling","architecture"]
+        _selected_domains = _selected_domains[:MAX_LEADS]
+        leads = []
+        for d in _selected_domains:
+            a = swarm.spawn_lead(root.agent_id, d, model=coder_model)
+            if a: leads.append(a); emit("openhands_worker", f"  Lead: {a.agent_id} [{d}]")
+        emit("openhands_worker", f"🧭 {len(leads)} Leads across {len(_selected_domains)} domains")
+
+        # ── Shared worktree ──
+        wt_info = prepare_execution_worktree(source_workspace, execution_id)
+        shared_workspace = str(wt_info.get("workspacePath") or source_workspace)
+        if direct_workspace and not setup_completed:
+            setup_results = run_setup_commands(state["workspacePath"], list(spec.get("commandsToRun") or []),
+                target_project_dir=str(spec.get("targetProjectDir") or spec.get("projectRoot") or "."))
+            setup_completed = True
+
+        # ── Build task queue from Leads ──
+        _all_tasks: queue.Queue[dict[str, Any]] = queue.Queue()
         _rework_files: list[str] = []
         if rework_ctx:
             for b in (rework_ctx.get("blockers") or []):
@@ -1678,240 +1707,106 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 for field in ("stdout", "stderr"):
                     _rework_files.extend(re.findall(r'([^\s:,]+\.(?:py|ts|tsx|js|jsx|vue|css|html))[:(\d]', str(cr.get(field, ""))))
             _rework_files = sorted(set(p.replace("\\", "/") for p in _rework_files))[:40]
+        ti = 0
+        for la in leads:
+            d = la.role
+            if _rework_files:
+                df = [f for f in _rework_files if any(f.endswith(ext) for ext in {".tsx",".jsx",".vue",".html",".css"} if d=="frontend")]
+                for f in df[:MAX_SPECIALISTS_PER_LEAD]:
+                    sp = swarm.spawn_specialist(la.agent_id, f"Fix {f}", model=coder_model)
+                    if sp: _all_tasks.put({"idx":ti,"label":sp.agent_id,"agent_id":sp.agent_id,"domain":d,"parent_id":la.agent_id,"prompt_extra":f"Fix error in {f}. Read diagnostics, apply minimal fix.","allowedFiles":[f],"forbiddenPaths":[]}); ti+=1
+                continue
+            if d == "product_requirement":
+                sp = swarm.spawn_specialist(la.agent_id, "Write product spec", model=coder_model)
+                if sp: _all_tasks.put({"idx":ti,"label":sp.agent_id,"agent_id":sp.agent_id,"domain":d,"parent_id":la.agent_id,"prompt_extra":"Analyze user goal+codebase. Write SPEC.md with acceptance criteria.","allowedFiles":["SPEC.md"],"forbiddenPaths":[]}); ti+=1
+            elif d in ("frontend","backend","api","database"):
+                for j in range(min(3, MAX_SPECIALISTS_PER_LEAD)):
+                    sp = swarm.spawn_specialist(la.agent_id, f"Implement {d} slice {j+1}", model=coder_model)
+                    if sp: _all_tasks.put({"idx":ti,"label":sp.agent_id,"agent_id":sp.agent_id,"domain":d,"parent_id":la.agent_id,"prompt_extra":f"Implement {d} functionality slice {j+1}/3.","allowedFiles":list(spec.get("allowedFiles") or []),"forbiddenPaths":list(spec.get("forbiddenPaths") or [])}); ti+=1
+        total_items = _all_tasks.qsize()
+        emit("openhands_worker", f"🐝 {len(leads)}L · {total_items} tasks · concurrency={max_concurrency}")
 
-        # ── A2A message bus for inter-agent coordination ──
-        from .a2a.message_bus import get_message_bus
-        from .a2a.types import Message as A2AMessage, TextPart
-        bus = get_message_bus()
-        bus_topic = f"coder.fleet.{execution_id}"
-        # Agents broadcast which file they're working on so others skip it.
-        _claimed_files: set[str] = set()
-        _claimed_lock = threading.Lock()
-
-        def _claim_file(path: str) -> bool:
-            with _claimed_lock:
-                if path in _claimed_files:
-                    return False
-                _claimed_files.add(path)
-                return True
-
-        # ── Build work queue ──
-        # Merge explicit allowedFiles with files extracted from tester diagnostics.
-        allowed_all = list(spec.get("allowedFiles") or [])
-        if not allowed_all and _rework_files:
-            allowed_all = list(_rework_files)
-            emit("openhands_worker", f"Rework mode: targeting {len(allowed_all)} file(s) from diagnostics: {', '.join(allowed_all[:8])}")
-        _workq: queue.Queue[dict[str, Any]] = queue.Queue()
-        if subtasks:
-            for i, st in enumerate(subtasks):
-                _workq.put({
-                    "idx": i, "label": st.get("title") or st.get("id") or f"sub-{i}",
-                    "prompt_extra": st.get("description") or st.get("task") or str(st),
-                    "allowedFiles": list(st.get("allowedFiles") or []),
-                    "forbiddenPaths": list(st.get("forbiddenPaths") or []),
-                })
-        if _workq.empty():
-            n = max_workers
-            if len(allowed_all) > 1:
-                chunk_sz = max(1, len(allowed_all) // n)
-                for i in range(n):
-                    chunk = allowed_all[i * chunk_sz : (i + 1) * chunk_sz if i < n - 1 else len(allowed_all)]
-                    if not chunk:
-                        continue
-                    _workq.put({"idx": i, "label": f"file-{i + 1}",
-                                "prompt_extra": f"ONLY edit these files: {', '.join(chunk[:10])}",
-                                "allowedFiles": chunk,
-                                "forbiddenPaths": list(spec.get("forbiddenPaths") or [])})
-            if _workq.empty():
-                # Partition by existing workspace files so agents work disjoint.
-                try:
-                    from .workspace import walk_workspace
-                    existing = [f["path"] for f in walk_workspace(shared_workspace, max_files=200, max_depth=5)
-                                if f.get("path", "").endswith((".py",".ts",".tsx",".js",".jsx",".vue",".css",".html"))]
-                    # Exclude generated/vendor paths.
-                    existing = [p for p in existing if not any(p.startswith(d) for d in (".git/","node_modules/","dist/","build/","out/","__pycache__/",".venv/",".agent-state/",".codegraph/",".pytest_cache/"))]
-                    if existing and len(existing) >= n:
-                        chunk_sz = max(1, len(existing) // n)
-                        for i in range(n):
-                            chunk = existing[i * chunk_sz : (i + 1) * chunk_sz if i < n - 1 else len(existing)]
-                            if not chunk:
-                                continue
-                            _workq.put({"idx": i, "label": f"files-{i + 1}",
-                                        "prompt_extra": f"ONLY edit these files: {', '.join(chunk[:12])}",
-                                        "allowedFiles": chunk,
-                                        "forbiddenPaths": list(spec.get("forbiddenPaths") or [])})
-                except Exception:
-                    pass
-            if _workq.empty():
-                # Greenfield or tiny project — 1 focused worker beats N fighting.
-                _workq.put({"idx": 0, "label": "creator",
-                            "prompt_extra": "Create the full project from scratch. Greenfield build.",
-                            "allowedFiles": allowed_all,
-                            "forbiddenPaths": list(spec.get("forbiddenPaths") or [])})
-
-        total_items = _workq.qsize()
-        emit("openhands_worker", f"⚡ FULL THROTTLE: {total_items} items, {max_workers} concurrent coders + work-stealing")
-
-        # ── Shared worktree ──
-        wt_info = prepare_execution_worktree(source_workspace, execution_id)
-        shared_workspace = str(wt_info.get("workspacePath") or source_workspace)
-        emit("openhands_worker", f"Shared worktree: {shared_workspace}" if wt_info.get("ready") else f"Direct: {shared_workspace}")
-
-        # ── Setup (once) ──
-        if direct_workspace and not setup_completed:
-            setup_results = run_setup_commands(
-                state["workspacePath"],
-                list(spec.get("commandsToRun") or []),
-                target_project_dir=str(spec.get("targetProjectDir") or spec.get("projectRoot") or "."),
-            )
-            setup_completed = True
-
-        # ── Work-stealing worker pool ──
+        # ── Work-stealing execution pool ──
         worker_results: list[dict[str, Any]] = []
         _res_lock = threading.Lock()
 
-        def _steal_and_run(start_idx: int) -> None:
-            """Continuously steal work items from the shared queue until empty."""
+        def _run_sp(item):
+            ai = item.get("agent_id","?")
+            d = item.get("domain","?")
+            if ai in swarm.agents: swarm.agents[ai].status = "running"; swarm.heartbeat(ai)
+            sc = dict(spec); sc["allowedFiles"]=item.get("allowedFiles")or[]; sc["forbiddenPaths"]=item.get("forbiddenPaths")or[]
+            if item.get("prompt_extra"): sc["subtaskBrief"]=item["prompt_extra"]
+            for f in sc["allowedFiles"]: swarm.claim_file(ai, f)
+            emit("openhands_worker",f"🐝 [{ai}] start [{d}]",node="openhands_worker",agent_role="coder",status="running")
+            wr={}
+            try:
+                swarm.acquire()
+                try: wr=run_claude_code_worker(workspace=shared_workspace,model=coder_model,api_key=api_key_val,worker_task_spec={**sc,"setupCommandResults":setup_results if item["idx"]==0 else [],"contextEnvelope":_context(state,"openhands_worker")},rework_context=rework_ctx,emit=(lambda s,d,_kw=None,**kw: emit(s,f"[{ai}] {d}",**kw) if _kw is None else emit(s,d,**{**kw,**(_kw or {})})),execution_id=f"{execution_id}-{ai}",worker_attempt=worker_attempt_base+item["idx"])
+                finally: swarm.release()
+                wr["agentId"]=ai; wr["domain"]=d
+                ch=[f.get("path")or""for f in(wr.get("changedFiles")or[])]
+                if ch: swarm.send_message(ai,"root","TASK_COMPLETED",task_id=ai,payload={"changedFiles":ch})
+                if ai in swarm.agents: swarm.agents[ai].status="completed"
+                emit("openhands_worker",f"✓ [{ai}] done · {len(ch)} files",node="openhands_worker",agent_role="coder",status="completed")
+            except Exception as e:
+                wr={"error":str(e),"agentId":ai,"domain":d,"changedFiles":[]}
+                if ai in swarm.agents: swarm.agents[ai].status="failed"
+                swarm.send_message(ai,"root","AGENT_CRASHED",task_id=ai,payload={"error":str(e)})
+                emit("openhands_worker",f"✗ [{ai}] crash",node="openhands_worker",agent_role="coder",status="error",error=str(e)[:500])
+            finally:
+                for f in sc["allowedFiles"]: swarm.release_file(ai,f)
+            with _res_lock: worker_results.append(wr)
+            return wr
+
+        if total_items<=1:
             while True:
-                try:
-                    item = _workq.get_nowait()
-                except queue.Empty:
-                    break
-                idx = item["idx"]
-                label = item["label"]
-                scoped_spec = dict(spec)
-                scoped_spec["allowedFiles"] = item.get("allowedFiles") or []
-                scoped_spec["forbiddenPaths"] = item.get("forbiddenPaths") or []
-                if item.get("prompt_extra"):
-                    scoped_spec["subtaskBrief"] = item["prompt_extra"]
-                scoped_spec["fleetContext"] = {
-                    "totalItems": total_items,
-                    "claimedFiles": sorted(_claimed_files),
-                    "peerResults": len(worker_results),
-                }
-                # Emit fleet status so the UI Stream tab shows live per-agent action.
-                emit("openhands_worker", f"⚡ started [{label}]", node="openhands_worker",
-                     agent_role="coder", status="running",
-                     input=f"FLEET: {len(worker_results)}/{total_items} done, starting {label}")
-                wr: dict[str, Any] = {}
-                try:
-                    wr = run_claude_code_worker(
-                        workspace=shared_workspace,
-                        model=coder_model,
-                        api_key=api_key_val,
-                        worker_task_spec={
-                            **scoped_spec,
-                            "setupCommandResults": setup_results if idx == 0 else [],
-                            "contextEnvelope": _context(state, "openhands_worker"),
-                        },
-                        rework_context=rework_ctx,
-                        emit=(lambda stage, detail, **kw: emit(stage, f"[{label}] {detail}", **kw)),
-                        execution_id=f"{execution_id}-{label}",
-                        worker_attempt=worker_attempt_base + idx,
-                    )
-                    wr["subtaskLabel"] = label
-                    wr["subtaskIdx"] = idx
-                    changed = [f.get("path") or "" for f in (wr.get("changedFiles") or [])]
-                    if changed:
-                        try:
-                            bus.publish(
-                                A2AMessage(role="agent", parts=[TextPart(text=f"done: {', '.join(changed[:8])}")],
-                                        contextId=execution_id, taskId=label),
-                                topic=bus_topic, sender_agent_id=f"coder-{label}",
-                            )
-                        except Exception:
-                            pass
-                    emit("openhands_worker", f"✓ [{label}] hoàn tất · {len(changed)} file",
-                         node="openhands_worker", agent_role="coder", status="completed",
-                         output=f"{len(changed)} files changed")
-                except Exception as exc:
-                    wr = {"error": str(exc), "summary": f"{label} crashed: {exc}", "changedFiles": [],
-                          "subtaskLabel": label, "subtaskIdx": idx}
-                    emit("openhands_worker", f"✗ [{label}] crash", node="openhands_worker",
-                         agent_role="coder", status="error", error=str(exc)[:500])
-                with _res_lock:
-                    worker_results.append(wr)
-                _workq.task_done()
-
-        # Subscribe fleet to inter-agent notifications.
-        try:
-            bus.subscribe(bus_topic, lambda msg: None, agent_id=f"fleet-{execution_id}")
-        except Exception:
-            pass
-
-        if max_workers == 1 or _workq.qsize() <= 1:
-            _steal_and_run(0)
+                try: _run_sp(_all_tasks.get_nowait())
+                except queue.Empty: break
         else:
-            n_threads = min(max_workers, _workq.qsize())
-            with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as pool:
-                futs = [pool.submit(_steal_and_run, i) for i in range(n_threads)]
-                for fut in concurrent.futures.as_completed(futs):
-                    try:
-                        fut.result()
-                    except Exception:
-                        pass
-                pool.shutdown(wait=True)
+            nt=min(max_concurrency,total_items)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=nt)as pool:
+                fs=[]
+                while True:
+                    try: fs.append(pool.submit(_run_sp,_all_tasks.get_nowait()))
+                    except queue.Empty: break
+                for f in concurrent.futures.as_completed(fs):
+                    try: f.result()
+                    except Exception: pass
 
-        # ── Merge worktree changes ──
-        broker_events: list[dict[str, Any]] = state.get("brokerEvents", [])
+        # ── Merge + aggregate ──
+        broker_events=state.get("brokerEvents",[])
         if wt_info.get("ready"):
-            merge = merge_execution_worktree(
-                wt_info, allowed_patterns=allowed_all,
-                forbidden_patterns=list(spec.get("forbiddenPaths") or []),
-            )
+            merge=merge_execution_worktree(wt_info,allowed_patterns=list(spec.get("allowedFiles")or[]),forbidden_patterns=list(spec.get("forbiddenPaths")or[]))
             cleanup_execution_worktree(wt_info)
-        else:
-            merge = {"applied": [], "conflicts": []}
-
-        # ── Aggregate results ──
-        all_changed = list(merge.get("applied") or [])
-        errors: list[str] = []
-        for wr in worker_results:
-            if wr.get("error"):
-                errors.append(f"[{wr.get('subtaskLabel', '?')}] {wr['error']}")
-            for f in (wr.get("changedFiles") or []):
-                path = f.get("path") or ""
-                if path and path not in {c.get("path") for c in all_changed}:
-                    all_changed.append({"path": path, "status": "modified"})
-
-        ok_count = len([w for w in worker_results if not w.get("error")])
-        combined = {
-            "summary": f"{total_items} items · {ok_count}/{len(worker_results)} workers ok · {len(all_changed)} files changed",
-            "changedFiles": all_changed,
-            "policyViolations": merge.get("policyViolations") or [],
-            "sandboxed": False,
-            "setupCommandResults": setup_results,
-        }
-        if errors:
-            combined["error"] = "; ".join(errors[:8])
-
-        # ── Post-worker dependency sync ──
-        if direct_workspace and str(spec.get("projectStack") or "").lower() == "node":
-            target = str(spec.get("targetProjectDir") or spec.get("projectRoot") or ".")
-            project_root = Path(state["workspacePath"]) if target in {"", "."} else Path(state["workspacePath"]) / target
-            if (project_root / "package.json").is_file():
-                lock = next((p for p in ("pnpm-lock.yaml","yarn.lock","bun.lock","bun.lockb") if (project_root / p).is_file()), None)
-                cmd_map = {"pnpm-lock.yaml":"pnpm install","yarn.lock":"yarn install","bun.lock":"bun install","bun.lockb":"bun install"}
-                cmd = cmd_map.get(lock or "", "npm install")
-                emit("setup_commands", f"Dependency sync: {cmd}")
-                setup_results.extend(run_setup_commands(state["workspacePath"], [cmd], target_project_dir=target))
-        combined["setupCommandResults"] = setup_results
-
-        subtask_id = None
+        else: merge={"applied":[],"conflicts":[]}
+        ac=list(merge.get("applied")or[]); es=[]
+        for w in worker_results:
+            if w.get("error"): es.append(f"[{w.get('agentId','?')}] {w['error']}")
+            for f in(w.get("changedFiles")or[]):
+                p=f.get("path")or""
+                if p and p not in{c.get("path")for c in ac}: ac.append({"path":p,"status":"modified"})
+        ok=len([w for w in worker_results if not w.get("error")])
+        verdict=swarm.completion_verdict()
+        tree_json=_json.dumps(swarm.tree_dict(),ensure_ascii=False)[:40000]
+        emit("openhands_worker",f"🐝 verdict:{verdict.get('pass')} ok:{ok}/{len(worker_results)} stats:{swarm.stats}",node="openhands_worker",agent_role="orchestrator",status="completed",output=tree_json)
+        combined={"summary":f"Swarm: {len(leads)}L,{total_items}T,{ok}ok,{len(ac)}files","changedFiles":ac,"policyViolations":merge.get("policyViolations")or[],"sandboxed":False,"setupCommandResults":setup_results,"swarmTree":swarm.tree_dict(),"swarmStats":swarm.stats,"completionVerdict":verdict}
+        if es: combined["error"]="; ".join(es[:8])
+        if direct_workspace and str(spec.get("projectStack")or"").lower()=="node":
+            target=str(spec.get("targetProjectDir")or spec.get("projectRoot")or".")
+            pr=Path(state["workspacePath"])if target in{"","."}else Path(state["workspacePath"])/target
+            if(pr/"package.json").is_file():
+                lk=next((p for p in("pnpm-lock.yaml","yarn.lock","bun.lock","bun.lockb")if(pr/p).is_file()),None)
+                cmd={"pnpm-lock.yaml":"pnpm install","yarn.lock":"yarn install","bun.lock":"bun install","bun.lockb":"bun install"}.get(lk or"","npm install")
+                emit("setup_commands",f"Deps: {cmd}"); setup_results.extend(run_setup_commands(state["workspacePath"],[cmd],target_project_dir=target))
+        combined["setupCommandResults"]=setup_results
+        sid=None
         if run_id:
-            with _open_broker() as broker:
-                st = broker.start_role(run_id, "coder", f"{total_items} parallel worker(s)", _context(state, "openhands_worker"))
-                subtask_id = st["id"]
-                broker.complete_subtask(run_id, subtask_id, "coder", combined, "failed" if errors else "completed")
-                broker_events = broker.events(run_id)
-
-        return {
-            "workerAttempts": [combined],
-            "retryCount": state.get("retryCount", 0) + 1,
-            "brokerEvents": broker_events,
-            "setupCommandResults": setup_results,
-            "setupCommandsCompleted": setup_completed,
-        }
+            with _open_broker()as broker:
+                st=broker.start_role(run_id,"coder",f"Swarm:{len(leads)}L,{total_items}T",_context(state,"openhands_worker"))
+                sid=st["id"]; broker.complete_subtask(run_id,sid,"coder",combined,"failed"if es else"completed")
+                broker_events=broker.events(run_id)
+        if swarm.root_id and swarm.root_id in swarm.agents: swarm.agents[swarm.root_id].status="completed"
+        return {"workerAttempts":[combined],"retryCount":state.get("retryCount",0)+1,"brokerEvents":broker_events,"setupCommandResults":setup_results,"setupCommandsCompleted":setup_completed}
 
     def tester_agent(state: PipelineState) -> dict[str, Any]:
         environment = state.get("executionEnvironment") or {}
