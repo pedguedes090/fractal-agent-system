@@ -739,6 +739,26 @@ text.flow-node-speed.speed-slow { fill: #F87171; }
 .doctor-summary.pass { background: var(--accent-soft); color: var(--accent); }
 .doctor-summary.fail { background: #FEF2F2; color: var(--status-error); }
 
+/* Swarm 3D */
+.swarm-toolbar {
+  position: absolute; top: 8px; right: 8px; z-index: 10;
+  display: flex; gap: 6px; align-items: center;
+  background: rgba(15,23,42,0.8); border: 1px solid #1E293B;
+  border-radius: var(--radius-md); padding: 4px 8px;
+}
+.swarm-btn {
+  background: #1E293B; color: #94A3B8; border: 1px solid #334155;
+  border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;
+}
+.swarm-btn:hover { color: #E2E8F0; border-color: #64748B; }
+.swarm-inspector {
+  position: absolute; bottom: 8px; right: 8px; z-index: 10;
+  background: rgba(15,23,42,0.92); border: 1px solid #1E293B;
+  border-radius: var(--radius-md); padding: 10px; max-width: 380px;
+  color: #E2E8F0;
+}
+.swarm-inspector h4 { margin: 0 0 6px; font-size: 13px; color: #94A3B8; }
+
 /* ═══════════════════════════════════════════════════════════════════════
    Responsive
    ═══════════════════════════════════════════════════════════════════════ */

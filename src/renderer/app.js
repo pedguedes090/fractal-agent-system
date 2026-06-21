@@ -1636,6 +1636,7 @@ async function init() {
     scheduleIdleAutonomyScan();
     if (E.messageInput) E.messageInput.focus();
     try { _doctorBindIpc(); } catch (e) { console.error("doctor bind failed:", e); }
+    try { _swarmInit(); } catch (e) { console.error("swarm init:", e); }
   } catch (error) {
     console.error('init error:', error);
     hideLoading();
@@ -2410,6 +2411,43 @@ function _doctorBindIpc() {
   });
   const btn = document.getElementById("doctorRunBtn");
   if (btn) btn.addEventListener("click", _doctorRun);
+}
+
+// ── Swarm 3D map ────────────────────────────────────────────────────────
+let _swarm3d = null;
+
+function _swarmInit() {
+  const container = document.getElementById("swarm3dContainer");
+  if (!container || !window.Swarm3DMap) return;
+  // Listen for swarm tree data from progress events.
+  window.addEventListener("agent:progress", (ev) => {
+    const p = ev.detail || ev;
+    if (!p || !p.output) return;
+    try {
+      const out = typeof p.output === "string" ? JSON.parse(p.output) : p.output;
+      if (out && out.agentId && out.children) {
+        // Got a swarm tree — load into 3D.
+        if (!_swarm3d) {
+          _swarm3d = new Swarm3DMap(container);
+          window._swarm3d = _swarm3d;
+        }
+        if (!_swarm3d.paused) _swarm3d.loadTree(out);
+        const stats = document.getElementById("swarmStats");
+        if (stats) {
+          const count = (out.children || []).reduce((s, c) => s + 1 + (c.children || []).length, 1);
+          stats.textContent = `${count} agents · ${Object.keys(_swarm3d.nodes||{}).length} nodes`;
+        }
+      }
+    } catch (e) {}
+  });
+  // Inspector on click
+  window.addEventListener("swarm:select", (ev) => {
+    const insp = document.getElementById("swarmInspector");
+    const pre = document.getElementById("swarmInspectorContent");
+    if (!insp || !pre || !ev.detail) return;
+    insp.style.display = "block";
+    pre.textContent = JSON.stringify(ev.detail, null, 2);
+  });
 }
 
 // Start when DOM is ready

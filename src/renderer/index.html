@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>He Thong Agent</title>
 <link rel="stylesheet" href="./styles.css" />
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
 <style>
 /* Critical inline — dashboard visible ngay cả khi styles.css chưa load */
 :root { --bg: #f7f5ef; --panel: #ffffff; --text: #1e2528; --muted: #69727a; --line: #ddd8cd; --primary: #176b63; --accent: #c7512f; }
@@ -67,6 +68,7 @@ html, body { margin:0; padding:0; min-height:100vh; background:#f7f5ef; color:#1
     <button class="tab" data-tab="changes">Thay đổi <span class="badge" id="changesBadge" style="display:none">0</span></button>
     <button class="tab" data-tab="log">Nhật ký</button>
     <button class="tab" data-tab="doctor">Doctor <span class="badge" id="doctorBadge" style="display:none">0</span></button>
+    <button class="tab" data-tab="swarm">🐝 Swarm 3D</button>
   </nav>
 
   <main class="dashboard-main">
@@ -186,6 +188,20 @@ html, body { margin:0; padding:0; min-height:100vh; background:#f7f5ef; color:#1
         </div>
       </div>
       <div id="doctorSummary" class="doctor-summary"></div>
+    </section>
+
+    <!-- Tab: Swarm 3D -->
+    <section class="tab-content" id="tab-swarm" style="padding:0">
+      <div class="swarm-toolbar">
+        <button onclick="window._swarm3d?.fitToScreen()" class="swarm-btn">Fit</button>
+        <button onclick="window._swarm3d?.setPaused(!window._swarm3d?.paused)" class="swarm-btn">⏯</button>
+        <span id="swarmStats" class="muted" style="font-size:11px;margin-left:8px"></span>
+      </div>
+      <div id="swarm3dContainer" style="width:100%;height:72vh"></div>
+      <div id="swarmInspector" class="swarm-inspector" style="display:none">
+        <h4>Agent Inspector</h4>
+        <pre id="swarmInspectorContent" style="font-size:11px;max-height:200px;overflow:auto"></pre>
+      </div>
     </section>
 
     <!-- Tab: Nhật ký -->

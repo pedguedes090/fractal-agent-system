@@ -1657,6 +1657,8 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         # ── Init swarm ──
         swarm = SwarmOrchestrator(execution_id=execution_id, workspace_path=source_workspace,
                                    original_user_goal=original_goal, max_concurrency=max_concurrency)
+        from .recovery_supervisor import RecoverySupervisor
+        recovery = RecoverySupervisor(swarm)
         root = swarm.spawn_root(model=coder_model)
         emit("openhands_worker", f"🐝 ROOT={root.agent_id} · cap={MAX_LEADS}L×{MAX_SPECIALISTS_PER_LEAD}S")
 
@@ -1752,6 +1754,9 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 wr={"error":str(e),"agentId":ai,"domain":d,"changedFiles":[]}
                 if ai in swarm.agents: swarm.agents[ai].status="failed"
                 swarm.send_message(ai,"root","AGENT_CRASHED",task_id=ai,payload={"error":str(e)})
+                # Recovery supervisor: classify + recover if infra error.
+                try: recovery.handle_agent_failure(ai,ai,str(e))
+                except Exception: pass
                 emit("openhands_worker",f"✗ [{ai}] crash",node="openhands_worker",agent_role="coder",status="error",error=str(e)[:500])
             finally:
                 for f in sc["allowedFiles"]: swarm.release_file(ai,f)
