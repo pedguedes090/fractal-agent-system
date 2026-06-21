@@ -1667,6 +1667,18 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
 
         max_workers = min(int(os.environ.get("AGENT_CODER_PARALLELISM", "20")), 20)
 
+        # ── Extract failing file paths from tester diagnostics so the rework
+        #     coder targets specific files instead of exploring the whole codebase.
+        #     Without this, the agent wanders, hits max_turns, and produces 0 files.
+        _rework_files: list[str] = []
+        if rework_ctx:
+            for b in (rework_ctx.get("blockers") or []):
+                _rework_files.extend(re.findall(r'([^\s:,]+\.(?:py|ts|tsx|js|jsx|vue|css|html|json|yaml|yml))[:(\d]', str(b)))
+            for cr in (rework_ctx.get("commandResults") or []):
+                for field in ("stdout", "stderr"):
+                    _rework_files.extend(re.findall(r'([^\s:,]+\.(?:py|ts|tsx|js|jsx|vue|css|html))[:(\d]', str(cr.get(field, ""))))
+            _rework_files = sorted(set(p.replace("\\", "/") for p in _rework_files))[:40]
+
         # ── A2A message bus for inter-agent coordination ──
         from .a2a.message_bus import get_message_bus
         from .a2a.types import Message as A2AMessage, TextPart
@@ -1684,7 +1696,11 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 return True
 
         # ── Build work queue ──
+        # Merge explicit allowedFiles with files extracted from tester diagnostics.
         allowed_all = list(spec.get("allowedFiles") or [])
+        if not allowed_all and _rework_files:
+            allowed_all = list(_rework_files)
+            emit("openhands_worker", f"Rework mode: targeting {len(allowed_all)} file(s) from diagnostics: {', '.join(allowed_all[:8])}")
         _workq: queue.Queue[dict[str, Any]] = queue.Queue()
         if subtasks:
             for i, st in enumerate(subtasks):
