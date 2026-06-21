@@ -121,6 +121,14 @@ routes:
     default: reporter
 
 contextRoutes:
+  preflight:
+    - task
+    - workspacePath
+    - settings
+  codegraph_context:
+    - task
+    - workspacePath
+    - preflight
   repo_intelligence:
     - task
     - taskIntent
@@ -170,10 +178,23 @@ contextRoutes:
   plan_arbiter:
     - critiqueFindings
     - repoIntelligence
+  planner_task_graph:
+    - task
+    - finalPlan
+    - repoIntelligence
   researcher_context_agent:
     - taskGraph
   governance_service:
     - researcherContext
+  human_gate:
+    - task
+    - finalPlan
+    - governanceDecision
+  environment_gate:
+    - task
+    - executionId
+    - workerHandoff
+    - settings
   read_only_reporter:
     - readOnlyHandoff
   load_context_files:
@@ -193,9 +214,19 @@ contextRoutes:
     - securityReview
   release_deploy_agent:
     - codeReview
+  doctor_feedback:
+    - task
+    - codeReview
+    - workspacePath
+    - doctorFindings
   reviewer_decision:
     - releasePlan
   reporter:
+    - latestReview
+  finalize_workspace:
+    - task
+    - executionId
+    - changedFiles
     - latestReview
   execution_gate:
     - task

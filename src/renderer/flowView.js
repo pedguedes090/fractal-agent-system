@@ -1006,10 +1006,28 @@ class FlowView {
 
   _subTools(id, { events }) {
     const calls = events.filter(e => e.eventType === "tool_call" || e.tool);
-    if (!calls.length) return `<p class="muted">Chưa có tool call nào được ghi nhận cho node này.</p>`;
-    let h = `<table class="kv-table"><thead><tr><th>Time</th><th>Tool</th><th>Status</th><th>Duration</th><th>Detail</th></tr></thead><tbody>`;
+    if (!calls.length) {
+      // Fallback: show any event that has a tool name or stage starts with "tool_" or "openhands_"
+      const fallback = events.filter(e =>
+        (e.tool) ||
+        (e.stage && /^(tool_|openhands_action|openhands_observation)/.test(e.stage))
+      );
+      if (fallback.length) {
+        let h = `<p class="muted" style="margin-bottom:8px">Hiển thị ${fallback.length} event có tool (eventType=tool_call chưa có — dùng fallback).</p>`;
+        h += `<table class="kv-table"><thead><tr><th>Time</th><th>Stage</th><th>Detail</th></tr></thead><tbody>`;
+        for (const ev of fallback) {
+          h += `<tr><td>${escapeHtml(this._formatTime(ev.at))}</td><td>${escapeHtml(ev.stage || ev.tool || "")}</td><td>${escapeHtml(String(ev.detail || "").slice(0, 200))}</td></tr>`;
+        }
+        h += `</tbody></table>`;
+        return h;
+      }
+      return `<p class="muted">Chưa có tool call nào được ghi nhận cho node này.</p>`;
+    }
+    let h = `<table class="kv-table"><thead><tr><th>Time</th><th>Tool</th><th>Status</th><th>Duration</th><th>Input</th><th>Result</th></tr></thead><tbody>`;
     for (const ev of calls) {
-      h += `<tr><td>${escapeHtml(this._formatTime(ev.at))}</td><td>${escapeHtml(ev.tool || "")}</td><td>${escapeHtml(ev.status || "")}</td><td>${escapeHtml(this._formatMs(ev.durationMs))}</td><td>${escapeHtml(String(ev.detail || "").slice(0, 160))}</td></tr>`;
+      const input = ev.toolInput ? `<details style="font-size:10px"><summary>Input</summary><pre class="event-json">${escapeHtml(String(ev.toolInput).slice(0, 400))}</pre></details>` : "—";
+      const result = ev.toolResult ? `<details style="font-size:10px"><summary>Result</summary><pre class="event-json">${escapeHtml(String(ev.toolResult).slice(0, 400))}</pre></details>` : escapeHtml(String(ev.detail || ev.error || "").slice(0, 160));
+      h += `<tr><td>${escapeHtml(this._formatTime(ev.at))}</td><td>${escapeHtml(ev.tool || "")}</td><td>${escapeHtml(ev.status || "")}</td><td>${escapeHtml(this._formatMs(ev.durationMs))}</td><td>${input}</td><td>${result}</td></tr>`;
     }
     h += `</tbody></table>`;
     return h;
