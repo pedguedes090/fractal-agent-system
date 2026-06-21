@@ -43,7 +43,6 @@ from .multi_agent import (
     reviewer_decision as aggregate_reviewer_decision,
     security_review_fallback,
 )
-from .openhands_worker import run_openhands_worker
 from .state_store import configure_connection, control_plane_path, migrate_legacy_tables
 from .workspace import (
     codegraph_affected_tests,
@@ -1596,15 +1595,76 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
         return {"contextFiles": files, "workerContext": worker_context}
 
     def openhands_worker(state: PipelineState) -> dict[str, Any]:
+        """Multi-coder fan-out: up to 20 Claude SDK agents in parallel worktrees.
+
+        The planner produces a task_graph with subtasks. Each subtask becomes a
+        dedicated claude_code_worker running concurrently in its own git worktree.
+        When there are no subtasks or only one, a single worker handles the full
+        workerTaskSpec (backward-compatible with simple plans).
+
+        All workers write to isolated worktrees; their changed files are merged
+        post-completion via merge_execution_worktree. A failed subtask worker
+        does NOT kill the others — its worktree is discarded, its error is
+        recorded, and the surviving workers' files are still merged.
+        """
+        import concurrent.futures
         spec = (state.get("workerContext") or {}).get("workerTaskSpec") or {}
-        mode = (state.get("executionEnvironment") or {}).get("executionMode") or "container"
+        task_graph = state.get("taskGraph") or {}
+        subtasks = list(task_graph.get("subtasks") or [])
         direct_workspace = bool((state.get("executionEnvironment") or {}).get("directWorkspace"))
-        if direct_workspace:
-            emit("openhands_worker", "OpenHands coding worker operating directly in the opened workspace")
-        else:
-            emit("openhands_worker", "OpenHands coding worker with container sandbox" if mode == "container" else "OpenHands coding worker with policy-limited host fallback")
         setup_results = list(state.get("setupCommandResults") or [])
         setup_completed = bool(state.get("setupCommandsCompleted"))
+        source_workspace = state.get("sourceWorkspacePath") or state.get("workspacePath", "")
+        execution_id = str(state.get("executionId", ""))
+        run_id = state.get("brokerRunId")
+        overrides = state["settings"].get("modelOverrides") or {}
+        coder_model = str(overrides.get("coder") or state["settings"]["model"])
+        api_key_val = runtime_settings().get("apiKey", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+        rework_ctx = state.get("latestReview")
+        worker_attempt_base = (state.get("reworkCycle", 0) * 100) + state.get("retryCount", 0) + 1
+        _cancel_chk = (lambda eid=execution_id: is_cancelled(eid))
+
+        # ── Resolve Claude SDK worker (single path — no OpenHands fallback) ──
+        from .claude_code_worker import run_claude_code_worker, _has_sdk as _ccw_has_sdk
+        if not _ccw_has_sdk():
+            emit("openhands_worker", "claude-agent-sdk not installed — coder cannot run. Install it with: pip install claude-agent-sdk")
+            return {
+                "workerAttempts": [{
+                    "error": "claude-agent-sdk not installed", "summary": "SDK missing",
+                    "changedFiles": [], "sandboxed": False, "policyViolations": [],
+                }],
+                "retryCount": state.get("retryCount", 0) + 1,
+                "brokerEvents": state.get("brokerEvents", []),
+                "setupCommandResults": setup_results,
+                "setupCommandsCompleted": setup_completed,
+            }
+
+        # ── Determine parallelism ──
+        max_workers = min(int(os.environ.get("AGENT_CODER_PARALLELISM", "20")), 20)
+        # Subtask-driven: each subtask → one worker. Floor 1.
+        work_items: list[dict[str, Any]] = []
+        if subtasks:
+            for i, st in enumerate(subtasks):
+                work_items.append({
+                    "idx": i,
+                    "label": st.get("title") or st.get("id") or f"subtask-{i}",
+                    "prompt_extra": st.get("description") or st.get("task") or str(st),
+                    "allowedFiles": list(st.get("allowedFiles") or spec.get("allowedFiles") or []),
+                    "forbiddenPaths": list(st.get("forbiddenPaths") or spec.get("forbiddenPaths") or []),
+                })
+        if not work_items:
+            # Fallback: single worker on the full spec.
+            work_items.append({
+                "idx": 0,
+                "label": spec.get("title") or spec.get("projectRoot") or "main",
+                "prompt_extra": "",
+                "allowedFiles": list(spec.get("allowedFiles") or []),
+                "forbiddenPaths": list(spec.get("forbiddenPaths") or []),
+            })
+        work_items = work_items[:max_workers]
+        emit("openhands_worker", f"Dispatching {len(work_items)} coder(s) in parallel (max {max_workers})")
+
+        # ── Setup commands (once, before fan-out, on the source workspace) ──
         if direct_workspace and not setup_completed:
             emit("setup_commands", "Running allowlisted setup/install commands in the opened workspace")
             setup_results = run_setup_commands(
@@ -1613,83 +1673,110 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                 target_project_dir=str(spec.get("targetProjectDir") or spec.get("projectRoot") or "."),
             )
             setup_completed = True
-        run_id = state.get("brokerRunId")
-        subtask_id = None
+
+        # ── Broker subtask tracking ──
         if run_id:
             with _open_broker() as broker:
                 subtask = broker.start_role(
-                    run_id,
-                    "coder",
-                    "Implement code changes inside allowedFiles",
+                    run_id, "coder",
+                    f"Parallel coding: {len(work_items)} worker(s)",
                     _context(state, "openhands_worker"),
                 )
                 subtask_id = subtask["id"]
-        overrides = state["settings"].get("modelOverrides") or {}
-        coder_model = str(overrides.get("coder") or state["settings"]["model"])
-        api_key_val = runtime_settings().get("apiKey", "") or os.environ.get("ANTHROPIC_API_KEY", "")
-        use_claude_sdk = str(os.getenv("AGENT_USE_OPENHANDS") or "0").lower() not in {"1", "true", "yes", "on"}
-        worker_result: dict[str, Any]
-        if use_claude_sdk:
-            try:
-                from .claude_code_worker import run_claude_code_worker, _has_sdk as _ccw_has_sdk
-            except Exception:
-                _ccw_has_sdk = lambda: False  # type: ignore[assignment]
-                run_claude_code_worker = None  # type: ignore[assignment]
-            if run_claude_code_worker is not None and _ccw_has_sdk():
-                emit("openhands_worker", "Using claude-agent-sdk worker (Read/Edit/Write/Bash with live stream)")
-                worker_result = run_claude_code_worker(
-                    workspace=state["workspacePath"],
-                    model=coder_model,
-                    api_key=api_key_val,
-                    worker_task_spec={
-                        **spec,
-                        "setupCommandResults": setup_results,
-                        "contextEnvelope": _context(state, "openhands_worker"),
-                    },
-                    rework_context=state.get("latestReview"),
-                    emit=emit,
-                    execution_id=state.get("executionId"),
-                    worker_attempt=(state.get("reworkCycle", 0) * 100) + state.get("retryCount", 0) + 1,
-                )
-            else:
-                emit("openhands_worker", "claude-agent-sdk unavailable — falling back to OpenHands worker")
-                worker_result = run_openhands_worker(
-                    workspace=state["workspacePath"],
-                    server_url=state["settings"]["serverUrl"],
-                    model=coder_model,
-                    api_key=api_key_val,
-                    worker_task_spec={
-                        **spec,
-                        "setupCommandResults": setup_results,
-                        "contextEnvelope": _context(state, "openhands_worker"),
-                    },
-                    rework_context=state.get("latestReview"),
-                    emit=emit,
-                    execution_id=state.get("executionId"),
-                    worker_attempt=(state.get("reworkCycle", 0) * 100) + state.get("retryCount", 0) + 1,
-                    dependency_workspace=state.get("sourceWorkspacePath"),
-                    worktree_isolated=True,
-                    is_cancelled=(lambda eid=state.get("executionId"): is_cancelled(eid)),
-                )
         else:
-            worker_result = run_openhands_worker(
-                workspace=state["workspacePath"],
-                server_url=state["settings"]["serverUrl"],
-                model=coder_model,
-                api_key=api_key_val,
-                worker_task_spec={
-                    **spec,
-                    "setupCommandResults": setup_results,
-                    "contextEnvelope": _context(state, "openhands_worker"),
-                },
-                rework_context=state.get("latestReview"),
-                emit=emit,
-                execution_id=state.get("executionId"),
-                worker_attempt=(state.get("reworkCycle", 0) * 100) + state.get("retryCount", 0) + 1,
-                dependency_workspace=state.get("sourceWorkspacePath"),
-                worktree_isolated=True,
-                is_cancelled=(lambda eid=state.get("executionId"): is_cancelled(eid)),
-            )
+            subtask_id = None
+
+        # ── Run each worker in its own thread, each in its own git worktree ──
+        worker_results: list[dict[str, Any]] = []
+        broker_events: list[dict[str, Any]] = state.get("brokerEvents", [])
+        _fanout_lock = threading.Lock()
+
+        def _run_one(item: dict[str, Any]) -> dict[str, Any]:
+            idx = item["idx"]
+            label = item["label"]
+            # Isolated git worktree per worker so concurrent edits never conflict.
+            wt_info = prepare_execution_worktree(source_workspace, f"{execution_id}-c{idx}")
+            wt_workspace = str(wt_info.get("workspacePath") or source_workspace)
+            try:
+                # Compose a scoped task spec for this subtask.
+                scoped_spec = dict(spec)
+                scoped_spec["allowedFiles"] = item.get("allowedFiles") or []
+                scoped_spec["forbiddenPaths"] = item.get("forbiddenPaths") or []
+                if item.get("prompt_extra"):
+                    scoped_spec["subtaskBrief"] = item["prompt_extra"]
+                wr = run_claude_code_worker(
+                    workspace=wt_workspace,
+                    model=coder_model,
+                    api_key=api_key_val,
+                    worker_task_spec={
+                        **scoped_spec,
+                        "setupCommandResults": setup_results if idx == 0 else [],
+                        "contextEnvelope": _context(state, "openhands_worker"),
+                    },
+                    rework_context=rework_ctx,
+                    emit=(lambda stage, detail, **kw: emit(stage, f"[c{idx}] {detail}", **kw)),
+                    execution_id=f"{execution_id}-c{idx}",
+                    worker_attempt=worker_attempt_base + idx,
+                )
+                wr["subtaskLabel"] = label
+                wr["subtaskIdx"] = idx
+                wr["worktreePath"] = wt_workspace
+                # Merge this worktree's changes back.
+                if wt_info.get("ready") and not wr.get("error"):
+                    changed = list(wr.get("changedFiles") or [])
+                    if changed:
+                        merge = merge_execution_worktree(
+                            wt_info,
+                            allowed_patterns=list(item.get("allowedFiles") or []),
+                            forbidden_patterns=list(item.get("forbiddenPaths") or []),
+                        )
+                        wr["changedFiles"] = merge.get("applied") or changed
+                else:
+                    wr["changedFiles"] = []
+            except Exception as exc:
+                wr = {
+                    "error": str(exc), "summary": f"Coder {idx} crashed: {exc}",
+                    "changedFiles": [], "sandboxed": False, "policyViolations": [],
+                    "subtaskLabel": label, "subtaskIdx": idx,
+                }
+            finally:
+                if wt_info.get("ready"):
+                    cleanup_execution_worktree(wt_info)
+            with _fanout_lock:
+                worker_results.append(wr)
+            return wr
+
+        if len(work_items) == 1:
+            _run_one(work_items[0])
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(work_items)) as pool:
+                futs = {pool.submit(_run_one, item): item for item in work_items}
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        fut.result()
+                    except Exception:
+                        pass  # already captured inside _run_one
+
+        # ── Aggregate results ──
+        all_changed: list[dict[str, Any]] = []
+        all_violations: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for wr in worker_results:
+            all_changed.extend(wr.get("changedFiles") or [])
+            all_violations.extend(wr.get("policyViolations") or [])
+            if wr.get("error"):
+                errors.append(f"[{wr.get('subtaskLabel', '?')}] {wr['error']}")
+        combined = {
+            "summary": f"{len(work_items)} coder(s) completed. {len([w for w in worker_results if not w.get('error')])} passed, {len(errors)} failed.",
+            "changedFiles": all_changed,
+            "policyViolations": all_violations,
+            "sandboxed": False,
+            "setupCommandResults": setup_results,
+        }
+        if errors:
+            combined["error"] = "; ".join(errors[:5])
+            combined["summary"] += " Errors: " + combined["error"]
+
         if direct_workspace and str(spec.get("projectStack") or "").lower() == "node":
             target = str(spec.get("targetProjectDir") or spec.get("projectRoot") or ".")
             project_root = Path(state["workspacePath"]) if target in {"", "."} else Path(state["workspacePath"]) / target
@@ -1710,16 +1797,16 @@ def build_graph(emit: Callable[[str, str], None], checkpointer: Any):
                         target_project_dir=target,
                     )
                 )
-        worker_result["setupCommandResults"] = setup_results
-        events = state.get("brokerEvents", [])
+        combined["setupCommandResults"] = setup_results
+
         if run_id and subtask_id:
             with _open_broker() as broker:
-                broker.complete_subtask(run_id, subtask_id, "coder", worker_result, "failed" if worker_result.get("error") else "completed")
-                events = broker.events(run_id)
+                broker.complete_subtask(run_id, subtask_id, "coder", combined, "failed" if errors else "completed")
+                broker_events = broker.events(run_id)
         return {
-            "workerAttempts": [worker_result],
+            "workerAttempts": [combined],
             "retryCount": state.get("retryCount", 0) + 1,
-            "brokerEvents": events,
+            "brokerEvents": broker_events,
             "setupCommandResults": setup_results,
             "setupCommandsCompleted": setup_completed,
         }
