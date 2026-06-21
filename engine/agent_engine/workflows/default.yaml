@@ -195,11 +195,43 @@ contextRoutes:
     - taskIntent
     - problem
     - repoIntelligence
+  planning_zero_to_one:
+    - taskIntent
+    - problem
+    - repoIntelligence
+  planning_user_journey:
+    - taskIntent
+    - problem
+    - repoIntelligence
+  planning_data_model:
+    - taskIntent
+    - problem
+    - repoIntelligence
+  planning_component_tree:
+    - taskIntent
+    - problem
+    - repoIntelligence
+  planning_spec_document:
+    - taskIntent
+    - problem
+    - repoIntelligence
+  planning_perf_budget:
+    - taskIntent
+    - problem
+    - repoIntelligence
+  planning_a11y_first:
+    - taskIntent
+    - problem
+    - repoIntelligence
   critique_risk:
     - candidatePlans
   critique_test_coverage:
     - candidatePlans
   critique_security_regression:
+    - candidatePlans
+  critique_architecture_fit:
+    - candidatePlans
+  critique_completeness:
     - candidatePlans
   plan_arbiter:
     - critiqueFindings
