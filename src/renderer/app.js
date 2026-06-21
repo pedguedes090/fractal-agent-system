@@ -1712,6 +1712,14 @@ function setupTabs() {
       });
       contents.forEach(c => c.classList.toggle("active", c.id === `tab-${name}`));
       if (name === "log") renderLogTab();
+      if (name === "swarm" && window.THREE && window.Swarm3DMap) {
+        setTimeout(() => {
+          const c = document.getElementById("swarm3dContainer");
+          if (c && !window._swarm3d) {
+            window._swarm3d = new window.Swarm3DMap(c);
+          }
+        }, 50);
+      }
       if (name === "review") {
         const activeSubtab = document.querySelector(".review-subtabs .subtab.active")?.dataset.subtab || "code";
         renderReviewSubtab(activeSubtab);

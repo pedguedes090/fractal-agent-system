@@ -191,10 +191,10 @@ html, body { margin:0; padding:0; min-height:100vh; background:#f7f5ef; color:#1
     </section>
 
     <!-- Tab: Swarm 3D -->
-    <section class="tab-content" id="tab-swarm" style="padding:0">
+    <section class="tab-content" id="tab-swarm" style="padding:0;position:relative">
       <div class="swarm-toolbar">
-        <button onclick="window._swarm3d?.fitToScreen()" class="swarm-btn">Fit</button>
-        <button onclick="window._swarm3d?.setPaused(!window._swarm3d?.paused)" class="swarm-btn">⏯</button>
+        <button id="swarmFitBtn" class="swarm-btn">Fit</button>
+        <button id="swarmPauseBtn" class="swarm-btn">⏯</button>
         <span id="swarmStats" class="muted" style="font-size:11px;margin-left:8px"></span>
       </div>
       <div id="swarm3dContainer" style="width:100%;height:72vh"></div>
